@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Dynamic Task Planner v0.4c",
+  "description": "Typed plans for validate, dry_run, and isolated test modes. No execution-capable fields are permitted.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "variables", "steps"],
+  "properties": {
+    "version": {"const": "0.4c"},
+    "variables": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["type"],
+        "properties": {
+          "type": {"enum": ["number", "search_results"]},
+          "unit": {"type": "string", "minLength": 1, "maxLength": 64}
+        }
+      }
+    },
+    "steps": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 10,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "operation", "args"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_-]{0,63}$"},
+          "operation": {"enum": ["search_knowledge", "extract_number", "calculate", "write_report", "verify_file"]},
+          "depends_on": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
+          "args": {"type": "object"}
+        }
+      }
+    }
+  },
+  "$comment": "search_knowledge uses query/limit/save_as(search_results); extract_number uses from/field/source/patterns/save_as(number), with one optional bounded refine_query/refine_limit fallback for missing evidence only; calculate uses an approved arithmetic operation and two numeric operands; write_report paths are under output/ or temp/ and placeholders are simple numeric variables or extracted fact fields; verify_file requires a dependent write_report reference for the same path.",
+  "x-security": [
+    "Only the fixed isolated knowledge-service endpoint is available in test mode.",
+    "Bearer credentials are read from a file and never returned or logged.",
+    "validate and dry_run perform no retrieval, writes, subprocesses, or production access.",
+    "test mode performs read-only isolated retrieval and keeps reports in memory."
+  ]
+}

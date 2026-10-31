@@ -1,0 +1,55 @@
+services:
+  planner-service:
+    build:
+      context: ../knowledge-service
+    container_name: planner-service-test
+    restart: "no"
+    working_dir: /workspace
+    command: ["python", "-m", "scripts.planner_service_v05b"]
+    environment:
+      PLANNER_BIND_HOST: "0.0.0.0"
+      PLANNER_BIND_PORT: "8105"
+      LM_STUDIO_ENDPOINT: "http://host.docker.internal:1234/v1/chat/completions"
+      PLANNER_API_TOKEN_FILE: "/run/secrets/planner_api_token"
+      KNOWLEDGE_TOKEN_FILE: "/run/secrets/agent_knowledge_token"
+      PLANNER_ISOLATED_ROOT: "/planner-test"
+      PLANNER_APPROVAL_DIR: "/planner-test/approvals"
+    expose:
+      - "8105"
+    volumes:
+      - type: bind
+        source: ../scripts
+        target: /workspace/scripts
+        read_only: true
+      - type: bind
+        source: ./planner-v05b
+        target: /planner-test
+      - type: bind
+        source: ./test-token.txt
+        target: /run/secrets/agent_knowledge_token
+        read_only: true
+      - type: bind
+        source: ./planner-api-token.txt
+        target: /run/secrets/planner_api_token
+        read_only: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 512m
+    cpus: 1.0
+    networks:
+      - agent-internal
+      - bridge
+
+networks:
+  agent-internal:
+    external: true
+    name: agent-internal
+  bridge:
+    external: true
+    name: bridge

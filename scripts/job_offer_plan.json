@@ -1,0 +1,21 @@
+{
+  "facts": {
+    "source": "sample.pdf (previously retrieved; not fetched by this prototype)",
+    "hourly_wage": 16,
+    "weekly_hours": 32,
+    "housing_per_day": 15,
+    "housing_days": 7
+  },
+  "steps": [
+    {"type": "calculate", "save_as": "weekly_gross", "operation": "multiply", "operands": ["hourly_wage", "weekly_hours"]},
+    {"type": "calculate", "save_as": "weekly_housing", "operation": "multiply", "operands": ["housing_per_day", "housing_days"]},
+    {"type": "calculate", "save_as": "difference_before_taxes", "operation": "subtract", "operands": ["weekly_gross", "weekly_housing"]},
+    {
+      "type": "write_template",
+      "path": "output/job-offer-controller-test.md",
+      "overwrite": true,
+      "template": "# Job Offer Summary (controller test)\n\nSource: {source}\n\n- Hourly wage: ${hourly_wage}/hour\n- Expected weekly hours: {weekly_hours}\n- Daily housing: ${housing_per_day}/day\n\n## Calculated estimates\n\n- Gross weekly earnings: ${weekly_gross}\n- Weekly housing (7 days): ${weekly_housing}\n- Difference before taxes and other expenses: ${difference_before_taxes}\n"
+    },
+    {"type": "verify_file", "path": "output/job-offer-controller-test.md"}
+  ]
+}

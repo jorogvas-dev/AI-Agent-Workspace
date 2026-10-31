@@ -1,0 +1,45 @@
+{
+  "facts": {
+    "source": "sample.pdf",
+    "housing_days": 7
+  },
+  "steps": [
+    {
+      "type": "lookup_number",
+      "save_as": "hourly_wage",
+      "source": "sample.pdf",
+      "query": "sample.pdf guaranteed salary wage per hour 16.00 overtime",
+      "limit": 10,
+      "patterns": [
+        "\\$\\s*(\\d+(?:\\.\\d+)?)\\s+Is\\s+Overtime\\s+available",
+        "(\\d+(?:\\.\\d+)?)\\s*\\$\\s*per\\s*hour"
+      ]
+    },
+    {
+      "type": "lookup_number",
+      "save_as": "weekly_hours",
+      "source": "sample.pdf",
+      "query": "sample.pdf average hours over 2 weeks period 32 hours per week",
+      "limit": 10,
+      "patterns": ["(\\d+(?:\\.\\d+)?)\\s+hours\\s+per\\s+week"]
+    },
+    {
+      "type": "lookup_number",
+      "save_as": "housing_per_day",
+      "source": "sample.pdf",
+      "query": "sample.pdf housing cost how often is rent due per day",
+      "limit": 10,
+      "patterns": ["Housing\\s+cost\\s+(\\d+(?:\\.\\d+)?)\\s+How\\s+often\\s+is\\s+rent\\s+due\\?\\s+Per\\s+day"]
+    },
+    {"type": "calculate", "save_as": "weekly_gross", "operation": "multiply", "operands": ["hourly_wage", "weekly_hours"]},
+    {"type": "calculate", "save_as": "weekly_housing", "operation": "multiply", "operands": ["housing_per_day", "housing_days"]},
+    {"type": "calculate", "save_as": "difference_before_taxes", "operation": "subtract", "operands": ["weekly_gross", "weekly_housing"]},
+    {
+      "type": "write_template",
+      "path": "output/job-offer-live-summary.md",
+      "overwrite": true,
+      "template": "# Job Offer Summary (live knowledge retrieval)\n\nSource: {source}\n\n## Retrieved facts\n\n- Hourly wage: ${hourly_wage}/hour (location: {hourly_wage_location})\n- Expected weekly hours: {weekly_hours} (location: {weekly_hours_location})\n- Daily housing: ${housing_per_day}/day (location: {housing_per_day_location})\n\n## Calculated estimates\n\n- Weekly gross earnings: ${weekly_gross}\n- Housing for 7 days: ${weekly_housing}\n- Difference before taxes and other expenses: ${difference_before_taxes}\n\nAll numerical facts above were extracted from live search results returned by the local knowledge service.\n"
+    },
+    {"type": "verify_file", "path": "output/job-offer-live-summary.md"}
+  ]
+}

@@ -1,0 +1,46 @@
+services:
+  chromadb-test:
+    image: chromadb/chroma:latest
+    container_name: chromadb-test
+    restart: "no"
+    expose:
+      - "8000"
+    volumes:
+      - type: bind
+        source: ./chroma-data
+        target: /data
+    networks:
+      - agent-test
+
+  knowledge-service-test:
+    build:
+      context: ../knowledge-service
+    container_name: knowledge-service-test
+    restart: "no"
+    expose:
+      - "8002"
+    environment:
+      CHROMA_HOST: chromadb-test
+      CHROMA_PORT: "8000"
+      KNOWLEDGE_TOKEN: ${TEST_KNOWLEDGE_TOKEN:?TEST_KNOWLEDGE_TOKEN must be set}
+      WATCHER_ENABLED: "true"
+      LM_STUDIO_URL: http://host.docker.internal:1234/v1/embeddings
+    volumes:
+      - type: bind
+        source: ./input
+        target: /workspace/input
+        read_only: true
+      - type: bind
+        source: ./knowledge
+        target: /workspace/knowledge
+        read_only: true
+    depends_on:
+      chromadb-test:
+        condition: service_started
+    networks:
+      - agent-test
+
+networks:
+  agent-test:
+    name: agent-test
+    driver: bridge

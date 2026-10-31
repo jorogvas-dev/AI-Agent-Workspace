@@ -1,0 +1,56 @@
+﻿
+# Python and dependencies
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+node_modules/
+
+# Credentials
+.env
+.env.*
+secrets/
+credentials/
+*token*.txt
+*secret*.txt
+*credential*.json
+.webui_secret_key
+*.pem
+*.key
+*.pfx
+*.p12
+
+# Documents and runtime data
+input/
+output/
+temp/
+knowledge/
+knowledge-db/
+data/
+approvals/
+receipts/
+cache/
+.cache/
+models/
+logs/
+*.log
+*.db
+*.db-*
+*.sqlite*
+*.pdf
+*.docx
+*.xlsx
+*.zip
+*.7z
+
+# Planner runtime state
+/test-environment/planner-v*/
+/test-environment/planner-bridge/
+
+# Debugging and editor backups
+*.bak
+*.backup
+*.orig
+*.rej
+*~

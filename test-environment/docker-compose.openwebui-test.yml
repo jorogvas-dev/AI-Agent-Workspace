@@ -1,0 +1,52 @@
+services:
+  open-webui-test:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui-test
+    restart: "no"
+    ports:
+      - "127.0.0.1:3001:8080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      RAG_EMBEDDING_MODEL_AUTO_UPDATE: "false"
+      HF_HOME: "/app/backend/data/cache/huggingface"
+      SENTENCE_TRANSFORMERS_HOME: "/app/backend/data/cache/embedding/models"
+    volumes:
+      - open-webui-test-data:/app/backend/data
+      - type: bind
+        source: ./openwebui-test-secret-key.txt
+        target: /app/backend/.webui_secret_key
+        read_only: true
+      - type: bind
+        source: ../tools/analyze_with_planner.py
+        target: /workspace/tools/analyze_with_planner.py
+        read_only: true
+      - type: bind
+        source: ./planner-api-token.txt
+        target: /run/secrets/planner_api_token
+        read_only: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 2g
+    cpus: 2.0
+    networks:
+      - agent-internal
+      - planner-egress
+
+volumes:
+  open-webui-test-data:
+    name: open-webui-test-data
+
+networks:
+  agent-internal:
+    external: true
+    name: agent-internal
+  planner-egress:
+    external: true
+    name: planner-egress-test
