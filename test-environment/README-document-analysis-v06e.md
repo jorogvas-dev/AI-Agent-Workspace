@@ -231,8 +231,19 @@ or networks, then restores and starts the originals:
 foreach ($name in $backups.Keys) {
   $id = & docker container inspect --format '{{.Id}}' $name 2>$null
   if ($LASTEXITCODE -eq 0) {
-    $project = & docker container inspect --format '{{ index .Config.Labels "com.docker.compose.project" }}' $name
-    if ($LASTEXITCODE -ne 0 -or $project -ne 'agent-document-test' -or $id -eq $originalIds[$name]) {
+    $labelsJson = & docker container inspect --format '{{json .Config.Labels}}' $name
+    if ($LASTEXITCODE -ne 0) { throw 'Refusing removal: label inspection failed.' }
+    try {
+      $labels = ConvertFrom-Json -InputObject $labelsJson -ErrorAction Stop
+    } catch {
+      throw 'Refusing removal: invalid container labels.'
+    }
+    if ($null -eq $labels -or $labels -isnot [pscustomobject] -or
+        $labelsJson -isnot [string] -or -not $labelsJson.TrimStart().StartsWith('{')) {
+      throw 'Refusing removal: invalid container labels.'
+    }
+    $project = $labels.'com.docker.compose.project'
+    if ($project -isnot [string] -or $project -cne 'agent-document-test' -or $id -eq $originalIds[$name]) {
       throw 'Refusing removal: container is not one of the new TEST stack containers.'
     }
     & docker container rm --force $name
