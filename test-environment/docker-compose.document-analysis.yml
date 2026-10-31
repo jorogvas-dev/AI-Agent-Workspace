@@ -1,0 +1,157 @@
+name: agent-document-test
+
+services:
+  knowledge-service-test:
+    image: local-agent-test/knowledge:v06e
+    pull_policy: never
+    container_name: knowledge-service-test
+    restart: "no"
+    working_dir: /app
+    command: ["python", "-u", "/app/server.py"]
+    expose:
+      - "8002"
+    environment:
+      CHROMA_HOST: "chromadb-test"
+      CHROMA_PORT: "8000"
+      LM_STUDIO_URL: "http://host.docker.internal:1234/v1/embeddings"
+      EMBEDDING_MODEL: "text-embedding-nomic-embed-text-v1.5@q8_0"
+      WATCHER_ENABLED: "true"
+      WATCH_INTERVAL_SECONDS: "15"
+      KNOWLEDGE_TOKEN: "${TEST_KNOWLEDGE_TOKEN:?TEST_KNOWLEDGE_TOKEN must be set}"
+    volumes:
+      - type: bind
+        source: ../knowledge-service/server.py
+        target: /app/server.py
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./input
+        target: /workspace/input
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./knowledge
+        target: /workspace/knowledge
+        read_only: true
+        bind:
+          create_host_path: false
+    networks:
+      - agent-internal
+      - planner-egress
+
+  planner-service:
+    image: local-agent-test/planner:v06e
+    pull_policy: never
+    container_name: planner-service-test
+    restart: "no"
+    working_dir: /workspace
+    command: ["python", "-m", "scripts.planner_service_v05b"]
+    environment:
+      PLANNER_BIND_HOST: "0.0.0.0"
+      PLANNER_BIND_PORT: "8105"
+      LM_STUDIO_ENDPOINT: "http://host.docker.internal:1234/v1/chat/completions"
+      PLANNER_API_TOKEN_FILE: "/run/secrets/planner_api_token"
+      KNOWLEDGE_TOKEN_FILE: "/run/secrets/agent_knowledge_token"
+      PLANNER_ISOLATED_ROOT: "/planner-test"
+      PLANNER_APPROVAL_DIR: "/planner-test/approvals"
+    expose:
+      - "8105"
+    volumes:
+      - type: bind
+        source: ../scripts
+        target: /workspace/scripts
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./planner-v05b
+        target: /planner-test
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./test-token.txt
+        target: /run/secrets/agent_knowledge_token
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./planner-api-token.txt
+        target: /run/secrets/planner_api_token
+        read_only: true
+        bind:
+          create_host_path: false
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 512m
+    cpus: 1.0
+    networks:
+      - agent-internal
+      - planner-egress
+
+  open-webui-test:
+    image: local-agent-test/webui:v06e
+    pull_policy: never
+    container_name: open-webui-test
+    restart: "no"
+    ports:
+      - "127.0.0.1:3001:8080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      RAG_EMBEDDING_MODEL_AUTO_UPDATE: "false"
+      HF_HOME: "/app/backend/data/cache/huggingface"
+      SENTENCE_TRANSFORMERS_HOME: "/app/backend/data/cache/embedding/models"
+    volumes:
+      - open-webui-test-data:/app/backend/data
+      - type: bind
+        source: ./openwebui-test-secret-key.txt
+        target: /app/backend/.webui_secret_key
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ../tools/analyze_with_planner.py
+        target: /workspace/tools/analyze_with_planner.py
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./planner-api-token.txt
+        target: /run/secrets/planner_api_token
+        read_only: true
+        bind:
+          create_host_path: false
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 2g
+    cpus: 2.0
+    networks:
+      - agent-internal
+      - planner-egress
+
+volumes:
+  open-webui-test-data:
+    external: true
+    name: open-webui-test-data
+
+networks:
+  agent-internal:
+    external: true
+    name: agent-internal
+  planner-egress:
+    external: true
+    name: planner-egress-test
