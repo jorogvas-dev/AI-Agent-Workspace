@@ -25,6 +25,7 @@ class OpenWebUITestDeploymentTests(unittest.TestCase):
     def test_tool_has_fixed_api_and_no_execution_surfaces(self):
         text = TOOL.read_text(encoding="utf-8")
         self.assertIn("http://planner-service:8105/analyze", text)
+        self.assertIn("http://planner-service:8105/analyze-document", text)
         self.assertIn("/run/secrets/planner_api_token", text)
         self.assertNotIn("task_planner_v04d", text)
         self.assertNotIn("docker.sock", text)
@@ -32,7 +33,7 @@ class OpenWebUITestDeploymentTests(unittest.TestCase):
 
     def test_service_has_health_and_analysis_only(self):
         text = SERVICE.read_text(encoding="utf-8")
-        self.assertIn('self.path != "/analyze"', text)
+        self.assertIn('self.path not in ("/analyze", "/analyze-document")', text)
         self.assertIn('self.path == "/health"', text)
         self.assertNotIn('self.path == "/commit"', text)
         self.assertNotIn('self.path == "/reconcile"', text)

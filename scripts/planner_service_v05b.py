@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Test-only HTTP bridge for v0.5a.2 planning and v0.4d PREPARE.
 
-The service exposes exactly POST /analyze. It never exposes COMMIT, reconcile,
+The service exposes POST /analyze and POST /analyze-document. It never exposes COMMIT, reconcile,
 approval records, credentials, Docker, or the executor. Configuration is
 service-side; request JSON contains only a natural-language request.
 """
@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from scripts import knowledge_adapter_v04c as knowledge_adapter
+from scripts import document_pipeline_v06c
 from scripts import task_planner_bridge_v05a2_v04d as bridge
 from scripts import task_planner_v05a2 as planner
 
@@ -41,7 +42,34 @@ class ServiceError(RuntimeError):
 
 
 def authorize_service_request(supplied: str, expected: str) -> bool:
-    return secrets.compare_digest(supplied, "Bearer " + expected)
+    if not isinstance(supplied, str) or not isinstance(expected, str) or not expected:
+        return False
+    try:
+        return secrets.compare_digest(supplied, "Bearer " + expected)
+    except TypeError:
+        return False
+
+
+def _validate_user_request(request: Any) -> None:
+    if not isinstance(request, str) or not request.strip() or len(request) > MAX_REQUEST_CHARS:
+        raise ServiceError("user request is invalid or too large")
+    try:
+        request.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ServiceError("user request is invalid or too large") from None
+
+
+def _strict_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def _reject_constant(value):
+    raise ValueError("non-standard JSON value")
 
 
 def _safe_error(exc: BaseException) -> str:
@@ -125,8 +153,7 @@ class PlannerService:
         self._slots = threading.BoundedSemaphore(MAX_CONCURRENT_ANALYSES)
 
     def analyze(self, request: str) -> dict[str, Any]:
-        if not isinstance(request, str) or not request.strip() or len(request) > MAX_REQUEST_CHARS:
-            raise ServiceError("user request is invalid or too large")
+        _validate_user_request(request)
         if not self._slots.acquire(timeout=1.0):
             raise ServiceError("planner service is busy")
         try:
@@ -152,6 +179,18 @@ class PlannerService:
         finally:
             self._slots.release()
 
+    def analyze_document(self, request: str) -> dict[str, Any]:
+        """Return the read-only generic pipeline result without legacy filtering."""
+        _validate_user_request(request)
+        if not self._slots.acquire(timeout=1.0):
+            raise ServiceError("planner service is busy")
+        try:
+            return document_pipeline_v06c.analyze_request(
+                request, adapter=self.adapter, client=self.model_client
+            )
+        finally:
+            self._slots.release()
+
 
 class Handler(BaseHTTPRequestHandler):
     service: PlannerService | None = None
@@ -169,7 +208,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self) -> None:
-        if self.path != "/analyze":
+        if self.path not in ("/analyze", "/analyze-document"):
             self._json(404, {"error": "Not found"})
             return
         supplied = self.headers.get("Authorization", "")
@@ -180,16 +219,35 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
             if length <= 0 or length > MAX_REQUEST_BYTES:
                 raise ServiceError("request body is invalid")
-            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            raw = self.rfile.read(length)
+            if len(raw) != length:
+                raise ServiceError("request body is invalid")
+            payload = json.loads(
+                raw.decode("utf-8"), object_pairs_hook=_strict_object,
+                parse_constant=_reject_constant,
+            )
             if not isinstance(payload, dict) or set(payload) != {"request"}:
                 raise ServiceError("request body must contain only request")
-            if self.service is None:
-                raise ServiceError("planner service unavailable")
-            self._json(200, self.service.analyze(payload["request"]))
-        except json.JSONDecodeError:
+            _validate_user_request(payload["request"])
+        except (UnicodeError, ValueError, RecursionError):
             self._json(400, {"valid": False, "error": "malformed JSON"})
+            return
         except ServiceError as exc:
             self._json(400, {"valid": False, "error": _safe_error(exc)})
+            return
+        except Exception:
+            self._json(500, {"valid": False, "error": "planner service failure"})
+            return
+        try:
+            if self.service is None:
+                raise ServiceError("planner service unavailable")
+            analysis = self.service.analyze if self.path == "/analyze" else self.service.analyze_document
+            self._json(200, analysis(payload["request"]))
+        except ServiceError as exc:
+            if str(exc) in {"planner service unavailable", "planner service is busy"}:
+                self._json(400, {"valid": False, "error": str(exc)})
+            else:
+                self._json(500, {"valid": False, "error": "planner service failure"})
         except Exception:
             self._json(500, {"valid": False, "error": "planner service failure"})
 
