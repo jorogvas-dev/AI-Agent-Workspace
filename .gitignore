@@ -54,3 +54,6 @@ logs/
 *.orig
 *.rej
 *~
+
+# Local vector database
+chroma-data/
