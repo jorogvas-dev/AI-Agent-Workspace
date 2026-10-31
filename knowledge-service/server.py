@@ -11,6 +11,7 @@ import secrets
 
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
 
 import requests
 import chromadb
@@ -74,6 +75,10 @@ CHUNK_SIZE = 1200
 CHUNK_OVERLAP = 200
 
 MAX_SEARCH_RESULTS = 10
+MAX_DOCUMENT_SOURCE_BYTES = 512
+MAX_DOCUMENT_PAGE = 50
+MAX_DOCUMENT_OFFSET = 10_000
+DOCUMENT_UNSET = object()
 EMBEDDING_DIMENSIONS = 768
 
 SUPPORTED_EXTENSIONS = {
@@ -1047,12 +1052,79 @@ def index_document(relative_path, force=False):
 # SEMANTIC KNOWLEDGE SEARCH
 # ============================================================
 
-def search_knowledge(query, limit=5):
+def validate_document_selector(document):
+    """Validate an opaque indexed identity, without accessing the filesystem."""
+    if not isinstance(document, dict) or set(document) != {"folder", "source"}:
+        raise ValueError("Document must contain exactly folder and source.")
+    folder, source = document["folder"], document["source"]
+    if not isinstance(folder, str) or folder not in {"input", "knowledge"}:
+        raise ValueError("Document folder must be input or knowledge.")
+    if (
+        not isinstance(source, str) or not source or source != source.strip()
+        or len(source.encode("utf-8")) > MAX_DOCUMENT_SOURCE_BYTES
+        or "\\" in source or ":" in source
+        or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in source)
+        or any(part in {"", ".", ".."} for part in source.split("/"))
+    ):
+        raise ValueError("Document source must be a bounded relative POSIX path.")
+    return {"folder": folder, "source": source}
+
+
+def list_documents(limit=50, offset=0):
+    """Read one bounded file-state metadata page; never open source files."""
+    if type(limit) is not int or not 1 <= limit <= MAX_DOCUMENT_PAGE:
+        raise ValueError("The limit parameter must be an integer from 1 to 50.")
+    if type(offset) is not int or not 0 <= offset <= MAX_DOCUMENT_OFFSET:
+        raise ValueError("The offset parameter must be an integer from 0 to 10000.")
+    with INDEX_LOCK:
+        if file_state_collection is None:
+            raise RuntimeError("File state is unavailable.")
+        total = file_state_collection.count()
+        page = file_state_collection.get(
+            limit=limit, offset=offset, include=["metadatas"]
+        )
+        ids = page.get("ids", [])
+        metadatas = page.get("metadatas", [])
+        if (
+            type(total) is not int or total < 0
+            or len(ids) > limit or len(ids) != len(metadatas)
+        ):
+            raise RuntimeError("Invalid file-state page.")
+        documents = []
+        for document_id, metadata in zip(ids, metadatas):
+            try:
+                identity = validate_document_selector({
+                    "folder": metadata["root"], "source": metadata["source"]
+                })
+            except (KeyError, TypeError, ValueError):
+                raise RuntimeError("Invalid file-state identity.") from None
+            if document_id != file_identity(identity["folder"], identity["source"]):
+                raise RuntimeError("Invalid file-state identity.")
+            documents.append({"document_id": document_id, **identity})
+    next_offset = offset + len(documents)
+    has_more = next_offset < total
+    return {
+        "status": "success",
+        "documents": documents,
+        "result_count": len(documents),
+        "pagination": {
+            "limit": limit, "offset": offset, "total": total,
+            "has_more": has_more,
+            "next_offset": next_offset if has_more and next_offset <= MAX_DOCUMENT_OFFSET else None,
+        },
+    }
+
+
+def search_knowledge(query, limit=5, document=DOCUMENT_UNSET):
     """
     Search indexed documents using semantic similarity.
 
     Returns matching text chunks with source information.
     """
+
+    scoped = document is not DOCUMENT_UNSET
+    if scoped:
+        document = validate_document_selector(document)
 
     if not isinstance(query, str) or not query.strip():
         raise ValueError("A search query is required.")
@@ -1064,6 +1136,9 @@ def search_knowledge(query, limit=5):
             f"Search query exceeds the {MAX_QUERY_CHARS:,} character limit."
         )
 
+    if scoped and len(query.encode("utf-8")) > 4000:
+        raise ValueError("Scoped search query exceeds the 4000 byte limit.")
+
     limit = max(
         1,
         min(int(limit), MAX_SEARCH_RESULTS)
@@ -1074,9 +1149,28 @@ def search_knowledge(query, limit=5):
     # Keep the count and query within the same critical section as index
     # replacement and cleanup so searches do not observe intermediate state.
     with INDEX_LOCK:
-        total_chunks = knowledge_collection.count()
+        if knowledge_collection is None:
+            raise RuntimeError("Knowledge collection is unavailable.")
+        query_options = {}
+        if scoped:
+            where = {"$and": [
+                {"root": document["folder"]}, {"source": document["source"]}
+            ]}
+            # At most top-k metadata records are needed to cap n_results.
+            matches = knowledge_collection.get(
+                where=where, limit=limit, include=["metadatas"]
+            )
+            total_chunks = len(matches["ids"])
+            query_options["where"] = where
+        else:
+            total_chunks = knowledge_collection.count()
 
         if total_chunks == 0:
+            if scoped:
+                return {
+                    "status": "success", "query": query,
+                    "result_count": 0, "results": []
+                }
             return {
                 "status": "empty",
                 "query": query,
@@ -1090,7 +1184,8 @@ def search_knowledge(query, limit=5):
                 "documents",
                 "metadatas",
                 "distances"
-            ]
+            ],
+            **query_options
         )
 
     documents = result.get("documents") or [[]]
@@ -1100,13 +1195,19 @@ def search_knowledge(query, limit=5):
 
     results = []
 
-    for index, document in enumerate(documents[0]):
+    for index, text in enumerate(documents[0]):
 
         metadata = (
             metadatas[0][index]
             if index < len(metadatas[0])
             else {}
         )
+
+        if scoped and (
+            metadata.get("root") != document["folder"]
+            or metadata.get("source") != document["source"]
+        ):
+            raise RuntimeError("Scoped search returned an invalid source.")
 
         distance = (
             distances[0][index]
@@ -1121,7 +1222,7 @@ def search_knowledge(query, limit=5):
         )
 
         results.append({
-            "text": document,
+            "text": text,
             "source": metadata.get("source", "Unknown"),
             "folder": metadata.get("root", "Unknown"),
             "location": metadata.get("location", "Unknown"),
@@ -1712,6 +1813,33 @@ class KnowledgeRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
 
+        if self.path == "/documents" or self.path.startswith("/documents?"):
+            if not authorized(self.headers):
+                json_response(self, 401, {"error": "Unauthorized."})
+                return
+            try:
+                if len(self.path) > 1024:
+                    raise ValueError("Invalid pagination parameters.")
+                parameters = parse_qs(
+                    urlsplit(self.path).query, keep_blank_values=True,
+                    strict_parsing=True, max_num_fields=2
+                )
+                if set(parameters) - {"limit", "offset"}:
+                    raise ValueError("Invalid pagination parameters.")
+                values = {}
+                for key, default in (("limit", "50"), ("offset", "0")):
+                    items = parameters.get(key, [default])
+                    if len(items) != 1 or not re.fullmatch(r"[0-9]{1,5}", items[0]):
+                        raise ValueError("Invalid pagination parameters.")
+                    values[key] = int(items[0])
+                json_response(self, 200, list_documents(**values))
+            except ValueError:
+                json_response(self, 400, {"error": "Invalid pagination parameters."})
+            except Exception:
+                logger.exception("Document catalog failed.")
+                json_response(self, 500, {"error": "Document catalog unavailable."})
+            return
+
         if self.path != "/health":
             json_response(
                 self,
@@ -1893,7 +2021,8 @@ class KnowledgeRequestHandler(BaseHTTPRequestHandler):
 
                 result = search_knowledge(
                     query,
-                    limit=limit
+                    limit=limit,
+                    **({"document": payload["document"]} if "document" in payload else {})
                 )
 
                 json_response(

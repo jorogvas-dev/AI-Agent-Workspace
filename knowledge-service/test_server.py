@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import sys
 import tempfile
@@ -6,7 +7,7 @@ import threading
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 os.environ.setdefault("KNOWLEDGE_TOKEN", "unit-test-token")
@@ -81,7 +82,7 @@ class InMemoryCollection:
 
         return all(metadata.get(key) == value for key, value in where.items())
 
-    def get(self, ids=None, where=None, include=None, limit=None):
+    def get(self, ids=None, where=None, include=None, limit=None, offset=0):
         records = [
             (record_id, record)
             for record_id, record in self.records.items()
@@ -94,6 +95,7 @@ class InMemoryCollection:
             if self._matches(record["metadata"], where)
         ]
 
+        records = records[offset:]
         if limit is not None:
             records = records[:limit]
 
@@ -145,6 +147,235 @@ class FakeHandler:
         self.rfile = io.BytesIO(body)
         self.connection = FakeConnection()
         self.responses = []
+
+
+class TrackingLock:
+    def __init__(self):
+        self.depth = 0
+
+    def __enter__(self):
+        self.depth += 1
+        return self
+
+    def __exit__(self, *args):
+        self.depth -= 1
+
+
+class ScopedCollection(InMemoryCollection):
+    """Apply filters before ranked top-k, and reject oversized n_results."""
+    def __init__(self, lock):
+        super().__init__()
+        self.lock = lock
+        self.get_calls = []
+        self.query_calls = []
+        self.count_calls = 0
+
+    def count(self):
+        assert self.lock.depth > 0, "count must hold INDEX_LOCK"
+        self.count_calls += 1
+        return super().count()
+
+    def get(self, **kwargs):
+        assert self.lock.depth > 0, "availability lookup must hold INDEX_LOCK"
+        self.get_calls.append(kwargs)
+        return super().get(**kwargs)
+
+    def query(self, **kwargs):
+        assert self.lock.depth > 0, "query must hold INDEX_LOCK"
+        self.query_calls.append(kwargs)
+        records = sorted(
+            ((key, value) for key, value in self.records.items()
+             if self._matches(value["metadata"], kwargs.get("where"))),
+            key=lambda item: item[1]["embedding"][0],
+        )
+        assert kwargs["n_results"] <= len(records)
+        records = records[:kwargs["n_results"]]
+        return {
+            "ids": [[key for key, _ in records]],
+            "documents": [[value["document"] for _, value in records]],
+            "metadatas": [[value["metadata"] for _, value in records]],
+            "distances": [[value["embedding"][0] for _, value in records]],
+        }
+
+
+class DocumentDiscoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.lock = TrackingLock()
+        self.state = ScopedCollection(self.lock)
+        self.chunks = ScopedCollection(self.lock)
+        for name, value in (
+            ("INDEX_LOCK", self.lock), ("file_state_collection", self.state),
+            ("knowledge_collection", self.chunks), ("SERVICE_TOKEN", "unit-test-token"),
+        ):
+            patcher = patch.object(server, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.embed = Mock(side_effect=self.embedding)
+        patcher = patch.object(server, "embed_texts", self.embed)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def embedding(self, texts):
+        self.assertEqual(self.lock.depth, 0, "remote embeddings must not hold commit lock")
+        return [[0.0] * server.EMBEDDING_DIMENSIONS]
+
+    def seed(self, folder, source, chunk_id, rank=1.0):
+        self.state.upsert(
+            ids=[server.file_identity(folder, source)],
+            documents=["must-not-be-returned"],
+            metadatas=[{"root": folder, "source": source, "sha256": "must-not-be-returned"}],
+            embeddings=[[0.0]],
+        )
+        self.chunks.upsert(
+            ids=[chunk_id], documents=[f"content for {chunk_id}"],
+            metadatas=[{"root": folder, "source": source, "location": "Section 2"}],
+            embeddings=[[rank]],
+        )
+
+    def http(self, method, path, payload=None, authenticated=True):
+        handler = FakeHandler(path, json.dumps(payload or {}).encode())
+        if not authenticated:
+            handler.headers["Authorization"] = "Bearer wrong-unit-test-token"
+        captured = []
+        with patch.object(server, "json_response", side_effect=lambda h, s, p: captured.append((s, p))):
+            getattr(server.KnowledgeRequestHandler, method)(handler)
+        self.assertEqual(len(captured), 1)
+        return captured[0]
+
+    def test_catalog_pages_only_metadata_and_existing_identities(self):
+        self.seed("input", "reports/entry.pdf", "a")
+        self.seed("knowledge", "reports/entry.pdf", "b")
+        self.seed("input", "other.md", "c")
+        with patch.object(Path, "open", side_effect=AssertionError("no source reads")):
+            status, first = self.http("do_GET", "/documents?limit=2&offset=0")
+            _, last = self.http("do_GET", "/documents?limit=2&offset=2")
+        self.assertEqual(status, 200)
+        self.assertEqual(first["pagination"], {
+            "limit": 2, "offset": 0, "total": 3, "has_more": True, "next_offset": 2,
+        })
+        self.assertEqual(first["result_count"], 2)
+        self.assertEqual({item["folder"] for item in first["documents"]}, {"input", "knowledge"})
+        self.assertEqual(len({item["document_id"] for item in first["documents"]}), 2)
+        self.assertEqual(last["result_count"], 1)
+        self.assertFalse(last["pagination"]["has_more"])
+        self.assertIsNone(last["pagination"]["next_offset"])
+        for item in first["documents"] + last["documents"]:
+            self.assertEqual(set(item), {"document_id", "folder", "source"})
+            self.assertEqual(item["document_id"], server.file_identity(item["folder"], item["source"]))
+        self.assertEqual(self.state.get_calls, [
+            {"limit": 2, "offset": 0, "include": ["metadatas"]},
+            {"limit": 2, "offset": 2, "include": ["metadatas"]},
+        ])
+        self.assertNotIn("must-not-be-returned", json.dumps(first))
+        self.embed.assert_not_called()
+
+    def test_catalog_defaults_empty_and_offset_boundary(self):
+        status, result = self.http("do_GET", "/documents")
+        self.assertEqual(status, 200)
+        self.assertEqual(result["documents"], [])
+        self.assertEqual(result["pagination"]["limit"], 50)
+        status, result = self.http("do_GET", "/documents?limit=1&offset=10000")
+        self.assertEqual(status, 200)
+        self.assertEqual(result["result_count"], 0)
+        self.assertEqual(self.state.get_calls[-1]["offset"], 10000)
+
+    def test_catalog_authentication_precedes_database_access(self):
+        status, result = self.http("do_GET", "/documents?limit=1", authenticated=False)
+        self.assertEqual((status, result), (401, {"error": "Unauthorized."}))
+        self.assertEqual(self.state.count_calls, 0)
+        self.assertEqual(self.state.get_calls, [])
+
+    def test_catalog_rejects_invalid_pagination_before_database_access(self):
+        for query in (
+            "limit=0", "limit=51", "limit=true", "limit=1.0", "limit=", "limit=-1",
+            "offset=-1", "offset=10001", "offset=1.5", "offset=+1", "offset=abc",
+            "limit=1&limit=2", "path=secret", "limit", "limit=1&offset=0&extra=1",
+        ):
+            with self.subTest(query=query):
+                self.assertEqual(self.http("do_GET", "/documents?" + query)[0], 400)
+        self.assertEqual(self.state.get_calls, [])
+
+    def test_catalog_invalid_stored_identity_and_database_failure_are_generic(self):
+        self.seed("input", "../../private.txt", "bad")
+        with patch.object(server.logger, "exception"):
+            status, result = self.http("do_GET", "/documents")
+            self.assertEqual(status, 500)
+            self.assertEqual(result, {"error": "Document catalog unavailable."})
+            with patch.object(self.state, "get", side_effect=RuntimeError("private database detail")):
+                self.assertEqual(self.http("do_GET", "/documents")[1], result)
+
+    def test_scoped_query_filters_before_top_k_in_both_folders(self):
+        self.seed("knowledge", "reports/entry.pdf", "competing-folder", 0.0)
+        self.seed("input", "unrelated.pdf", "competing-source", 0.1)
+        self.seed("input", "reports/entry.pdf", "target", 9.0)
+        for folder, expected in (("input", "target"), ("knowledge", "competing-folder")):
+            with self.subTest(folder=folder):
+                result = server.search_knowledge("field question", limit=1, document={"folder": folder, "source": "reports/entry.pdf"})
+                self.assertEqual(result["result_count"], 1)
+                self.assertEqual(result["results"][0]["chunk_id"], expected)
+                self.assertEqual(result["results"][0]["folder"], folder)
+                where = {"$and": [{"root": folder}, {"source": "reports/entry.pdf"}]}
+                self.assertEqual(self.chunks.query_calls[-1]["where"], where)
+                self.assertEqual(self.chunks.get_calls[-1], {"where": where, "limit": 1, "include": ["metadatas"]})
+        self.assertEqual(self.chunks.count_calls, 0)
+
+    def test_fewer_matching_chunks_caps_query_without_unbounded_count(self):
+        self.seed("input", "nested/document.md", "one", 1.0)
+        self.seed("input", "nested/document.md", "two", 2.0)
+        self.seed("knowledge", "other.pdf", "competitor", 0.0)
+        status, result = self.http("do_POST", "/search", {
+            "query": "question", "limit": 8,
+            "document": {"folder": "input", "source": "nested/document.md"},
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(result["result_count"], 2)
+        self.assertEqual(self.chunks.query_calls[-1]["n_results"], 2)
+        self.assertEqual(self.chunks.get_calls[-1]["limit"], 8)
+
+    def test_zero_scoped_matches_never_fall_back_to_global_query(self):
+        self.seed("knowledge", "existing.md", "competitor")
+        for records in (self.chunks.records.copy(), {}):
+            self.chunks.records = records
+            result = server.search_knowledge("question", document={"folder": "input", "source": "missing.md"})
+            self.assertEqual(result, {"status": "success", "query": "question", "result_count": 0, "results": []})
+        self.assertEqual(self.chunks.query_calls, [])
+
+    def test_malformed_selectors_rejected_before_embedding(self):
+        invalid = [None, [], "input/document.pdf", {}, {"folder": "input"},
+                   {"folder": "input", "source": "a.pdf", "where": {}},
+                   {"folder": [], "source": "a.pdf"}, {"folder": "output", "source": "a.pdf"}]
+        invalid += [{"folder": "input", "source": source} for source in (
+            None, 1, "", "../a.pdf", "a/../../b.pdf", "/a.pdf", "C:/a.pdf",
+            "https://example.invalid/a.pdf", "a\\b.pdf", "a//b.pdf", "a/./b.pdf",
+            "a.pdf\x00", "a.pdf\n", "a.pdf\x7f", "a.pdf\u0085", " a.pdf", "x" * 513,
+        )]
+        for document in invalid:
+            with self.subTest(document=document):
+                status, _ = self.http("do_POST", "/search", {"query": "question", "document": document})
+                self.assertEqual(status, 400)
+        self.embed.assert_not_called()
+        self.assertEqual(self.chunks.get_calls, [])
+
+    def test_scoped_query_utf8_limit_and_legacy_search_are_preserved(self):
+        self.seed("input", "example.md", "one")
+        selector = {"folder": "input", "source": "example.md"}
+        server.search_knowledge("é" * 2000, document=selector)
+        self.embed.reset_mock()
+        with self.assertRaises(ValueError):
+            server.search_knowledge("é" * 2001, document=selector)
+        self.embed.assert_not_called()
+        result = server.search_knowledge("legacy", limit=99)
+        self.assertEqual(result["result_count"], 1)
+        self.assertNotIn("where", self.chunks.query_calls[-1])
+        self.chunks.records.clear()
+        self.assertEqual(server.search_knowledge("legacy"), {"status": "empty", "query": "legacy", "results": []})
+
+    def test_scoped_search_requires_authentication(self):
+        status, _ = self.http("do_POST", "/search", {
+            "query": "question", "document": {"folder": "input", "source": "document.md"}
+        }, authenticated=False)
+        self.assertEqual(status, 401)
+        self.embed.assert_not_called()
 
 
 class KnowledgeServiceTests(unittest.TestCase):
