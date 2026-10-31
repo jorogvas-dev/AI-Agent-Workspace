@@ -33,6 +33,8 @@ DEFAULT_MODEL = "qwen2.5-7b-nerd-uncensored-v1.0"
 MAX_INTENT_BYTES = 64 * 1024
 MAX_RESPONSE_BYTES = 128 * 1024
 MAX_GENERATIONS = 2
+MAX_STRUCTURED_MESSAGE_BYTES = 16 * 1024
+MAX_STRUCTURED_OUTPUT_TOKENS = 4096
 CODE_PATTERN = re.compile(r"(?i)(?:\.repeat\s*\(|\b(?:eval|exec|__import__)\s*\(|\b(?:os\.system|subprocess)\b|javascript:|cmd\.exe|powershell\b)")
 
 
@@ -517,7 +519,45 @@ class IntentLMStudioClient:
         self._timeout = timeout
 
     def generate(self, messages: list[dict[str, str]]) -> str:
-        payload = {"model": self.model, "messages": messages, "temperature": 0, "stream": False, "response_format": {"type": "json_schema", "json_schema": {"name": "task_intent_v05a2", "strict": True, "schema": _client_schema()}}}
+        # Legacy callers retain their schema, schema name, and provider defaults.
+        return self._generate(messages, _client_schema(), "task_intent_v05a2")
+
+    def generate_structured(
+        self, messages: list[dict[str, str]], *, response_schema: dict[str, Any],
+        schema_name: str, max_output_tokens: int,
+    ) -> str:
+        """Generate against a caller-trusted schema, never a model-supplied one."""
+        if not isinstance(response_schema, dict) or response_schema.get("type") != "object":
+            raise ValueError("response_schema must be a trusted object schema")
+        if not isinstance(schema_name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]{0,63}", schema_name):
+            raise ValueError("schema name is invalid")
+        if type(max_output_tokens) is not int or not 1 <= max_output_tokens <= MAX_STRUCTURED_OUTPUT_TOKENS:
+            raise ValueError("structured output token limit is invalid")
+        if not isinstance(messages, list) or not 1 <= len(messages) <= 32:
+            raise ValueError("structured messages are invalid")
+        for message in messages:
+            if (
+                not isinstance(message, dict) or set(message) != {"role", "content"}
+                or message["role"] not in ("system", "user", "assistant")
+                or not isinstance(message["content"], str)
+            ):
+                raise ValueError("structured messages are invalid")
+        try:
+            message_bytes = json.dumps(messages, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+            schema_bytes = json.dumps(response_schema, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        except (ValueError, TypeError, RecursionError):
+            raise ValueError("structured input must be bounded JSON data") from None
+        if len(message_bytes) > MAX_STRUCTURED_MESSAGE_BYTES or len(schema_bytes) > MAX_INTENT_BYTES:
+            raise ValueError("structured input exceeds its size limit")
+        return self._generate(messages, response_schema, schema_name, max_output_tokens)
+
+    def _generate(
+        self, messages: list[dict[str, str]], response_schema: dict[str, Any],
+        schema_name: str, max_output_tokens: int | None = None,
+    ) -> str:
+        payload = {"model": self.model, "messages": messages, "temperature": 0, "stream": False, "response_format": {"type": "json_schema", "json_schema": {"name": schema_name, "strict": True, "schema": response_schema}}}
+        if max_output_tokens is not None:
+            payload["max_tokens"] = max_output_tokens
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         request = urllib.request.Request(self.endpoint, data=body, headers={"Content-Type": "application/json"}, method="POST")
         try:
@@ -529,12 +569,14 @@ class IntentLMStudioClient:
             raise LMUnavailable("LM Studio request failed") from None
         except (urllib.error.URLError, socket.timeout, TimeoutError, OSError):
             raise LMUnavailable("LM Studio is unavailable") from None
-        if len(raw) > MAX_RESPONSE_BYTES:
+        if not isinstance(raw, bytes) or len(raw) > MAX_RESPONSE_BYTES:
             raise ModelOutputError("model response exceeds the response limit")
         try:
             payload = json.loads(raw.decode("utf-8"))
             choice = payload["choices"][0]
             message = choice["message"]
+            if not isinstance(choice, dict) or not isinstance(message, dict):
+                raise TypeError
         except (UnicodeDecodeError, json.JSONDecodeError, KeyError, IndexError, TypeError):
             raise ModelOutputError("LM Studio returned an invalid response") from None
         if choice.get("finish_reason") == "length":

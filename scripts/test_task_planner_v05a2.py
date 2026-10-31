@@ -355,5 +355,106 @@ class PipelineV05a2Tests(unittest.TestCase):
         director.open.assert_called_once()
 
 
+class GenericLMStudioClientTests(unittest.TestCase):
+    def client(self, content='{"fields": []}', **choice_overrides):
+        choice = {"message": {"content": content}, **choice_overrides}
+        opener = Mock(return_value=Response(json.dumps({"choices": [choice]}).encode()))
+        return pipeline.IntentLMStudioClient(opener=opener), opener
+
+    def test_generic_schema_and_token_limits_use_existing_http_path(self):
+        schema = {"type": "object", "additionalProperties": False, "properties": {"fields": {"type": "array"}}}
+        for tokens in (768, 1536):
+            with self.subTest(tokens=tokens):
+                client, opener = self.client()
+                output = client.generate_structured(
+                    [{"role": "user", "content": "Extract requested fields"}],
+                    response_schema=schema, schema_name="document_extract_v06c", max_output_tokens=tokens,
+                )
+                self.assertEqual(output, '{"fields": []}')
+                request = opener.call_args.args[0]
+                self.assertEqual(request.full_url, pipeline.LM_STUDIO_WINDOWS_ENDPOINT)
+                self.assertEqual(opener.call_args.kwargs["timeout"], 30.0)
+                body = json.loads(request.data)
+                self.assertEqual(body["max_tokens"], tokens)
+                self.assertEqual(body["response_format"]["json_schema"], {
+                    "name": "document_extract_v06c", "strict": True, "schema": schema,
+                })
+                self.assertEqual(body["temperature"], 0)
+                self.assertIs(body["stream"], False)
+
+    def test_legacy_generate_keeps_schema_name_and_omits_output_token_override(self):
+        client, opener = self.client()
+        client.generate([{"role": "user", "content": "Legacy intent request"}])
+        body = json.loads(opener.call_args.args[0].data)
+        self.assertNotIn("max_tokens", body)
+        self.assertEqual(body["response_format"]["json_schema"]["name"], "task_intent_v05a2")
+        self.assertEqual(body["response_format"]["json_schema"]["schema"], pipeline.intent_json_schema())
+
+    def test_generic_input_validates_schema_name_tokens_and_messages_before_http(self):
+        valid = {"response_schema": {"type": "object"}, "schema_name": "fields", "max_output_tokens": 768}
+        client, opener = self.client()
+        for key, value in (
+            ("response_schema", []), ("response_schema", {"type": "array"}),
+            ("schema_name", "invalid name"), ("schema_name", "x" * 65),
+            ("max_output_tokens", 0), ("max_output_tokens", 4097),
+            ("max_output_tokens", True), ("max_output_tokens", "768"),
+        ):
+            with self.subTest(key=key, value=value):
+                with self.assertRaises(ValueError):
+                    client.generate_structured([{"role": "user", "content": "request"}], **{**valid, key: value})
+        for messages in ([], [{"role": "tool", "content": "code"}], [{"role": "user", "content": "x", "tools": []}]):
+            with self.assertRaises(ValueError):
+                client.generate_structured(messages, **valid)
+        opener.assert_not_called()
+
+    def test_generic_message_utf8_byte_boundary(self):
+        client, opener = self.client()
+        messages = [{"role": "user", "content": ""}]
+        overhead = len(json.dumps(messages, ensure_ascii=False, separators=(",", ":")).encode())
+        messages[0]["content"] = "x" * (pipeline.MAX_STRUCTURED_MESSAGE_BYTES - overhead)
+        kwargs = {"response_schema": {"type": "object"}, "schema_name": "fields", "max_output_tokens": 768}
+        client.generate_structured(messages, **kwargs)
+        opener.assert_called_once()
+        messages[0]["content"] += "é"
+        opener.reset_mock()
+        with self.assertRaisesRegex(ValueError, "size limit"):
+            client.generate_structured(messages, **kwargs)
+        opener.assert_not_called()
+
+    def test_generic_transport_failures_are_sanitized_and_not_retried(self):
+        for exception in (
+            urllib.error.URLError("private detail"),
+            TimeoutError("private detail"),
+            urllib.error.HTTPError(pipeline.LM_STUDIO_WINDOWS_ENDPOINT, 302, "private detail", {}, None),
+            urllib.error.HTTPError(pipeline.LM_STUDIO_WINDOWS_ENDPOINT, 400, "private detail", {}, None),
+        ):
+            if isinstance(exception, urllib.error.HTTPError):
+                self.addCleanup(exception.close)
+            with self.subTest(exception=type(exception).__name__):
+                opener = Mock(side_effect=exception)
+                client = pipeline.IntentLMStudioClient(opener=opener)
+                with self.assertRaises(pipeline.LMError) as caught:
+                    client.generate_structured(
+                        [{"role": "user", "content": "request"}],
+                        response_schema={"type": "object"}, schema_name="fields", max_output_tokens=768,
+                    )
+                self.assertNotIn("private detail", str(caught.exception))
+                opener.assert_called_once()
+
+    def test_generic_refusal_truncation_and_bad_response_are_rejected(self):
+        for response in (
+            {"choices": [{"message": {"content": "{}"}, "finish_reason": "length"}]},
+            {"choices": [{"message": {"content": "{}", "refusal": "private refusal"}}]},
+            {"choices": [{"message": []}]}, {"choices": []}, {"choices": [{"message": {"content": ""}}]},
+        ):
+            client = pipeline.IntentLMStudioClient(opener=Mock(return_value=Response(json.dumps(response).encode())))
+            with self.subTest(response=response):
+                with self.assertRaises(pipeline.ModelOutputError):
+                    client.generate_structured(
+                        [{"role": "user", "content": "request"}],
+                        response_schema={"type": "object"}, schema_name="fields", max_output_tokens=768,
+                    )
+
+
 if __name__ == "__main__":
     unittest.main()
