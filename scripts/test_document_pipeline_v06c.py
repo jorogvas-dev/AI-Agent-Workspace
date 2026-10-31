@@ -3,6 +3,7 @@ import copy
 import hashlib
 import io
 import json
+import re
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -306,8 +307,9 @@ class DocumentPipelineV06cTests(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertEqual([item["max_output_tokens"] for item in client.calls], [768, 1536])
         self.assertEqual([item["schema_name"] for item in client.calls], ["document_request_v06c", "document_extract_v06c"])
-        self.assertEqual(client.calls[1]["response_schema"], pipeline.response_schema())
-        candidate_schema = pipeline.response_schema()["properties"]["fields"]["items"]["properties"]["candidates"]["items"]["properties"]
+        fields = field_request()["fields"]
+        self.assertEqual(client.calls[1]["response_schema"], pipeline.response_schema(fields))
+        candidate_schema = pipeline.response_schema(fields)["properties"]["fields"]["items"]["properties"]["candidates"]["items"]["properties"]
         self.assertEqual(candidate_schema["value"]["type"], "string")
         first_input = json.loads(client.calls[0]["messages"][1]["content"])
         second_input = json.loads(client.calls[1]["messages"][1]["content"])
@@ -318,6 +320,150 @@ class DocumentPipelineV06cTests(unittest.TestCase):
         self.assertIn("Retain units", client.calls[1]["messages"][0]["content"])
         for call in client.calls:
             self.assertLessEqual(len(json.dumps(call["messages"], ensure_ascii=False, separators=(",", ":")).encode()), 16384)
+
+    def test_mixed_schema_sent_to_client_binds_numeric_names_to_numeric_branch(self):
+        fields = [
+            {"name": "occupancy_limit", "question": "What is the occupancy limit?", "value_type": "numeric"},
+            {"name": "booking_label", "question": "What is the booking label?", "value_type": "text"},
+        ]
+        planning = {"task_type": "field_extraction", "fields": fields}
+        opener = Mock(side_effect=[Response({"choices": [{"message": {"content": json.dumps(output)}}]})
+                                   for output in (planning, {"task_type": "field_extraction", "fields": []})])
+        client = pipeline.IntentLMStudioClient(opener=opener)
+        result, _, _ = self.run_request(
+            "Extract occupancy_limit and booking_label from arrival-card.txt.", client=client,
+        )
+        self.assertEqual(result["status"], "missing")
+        self.assertEqual(opener.call_count, 2)
+        body = json.loads(opener.call_args_list[1].args[0].data)
+        self.assertEqual(body["max_tokens"], 1536)
+        schema = body["response_format"]["json_schema"]["schema"]
+        items = schema["properties"]["fields"]["items"]
+        # No permissive sibling properties or unbound fallback branch.
+        self.assertEqual(set(items), {"anyOf"})
+        self.assertEqual(len(items["anyOf"]), 2)
+        base = engine.extraction_response_schema()["properties"]["fields"]["items"]
+        matched_names = set()
+        for branch in items["anyOf"]:
+            self.assertEqual(branch["type"], "object")
+            self.assertFalse(branch["additionalProperties"])
+            self.assertEqual(branch["required"], base["required"])
+            self.assertEqual(branch["properties"]["status"], base["properties"]["status"])
+            candidates = branch["properties"]["candidates"]
+            self.assertEqual(candidates["maxItems"], base["properties"]["candidates"]["maxItems"])
+            candidate = candidates["items"]
+            self.assertFalse(candidate["additionalProperties"])
+            self.assertEqual(candidate["required"], base["properties"]["candidates"]["items"]["required"])
+            for key in ("source", "chunk_id", "location", "quote"):
+                self.assertEqual(candidate["properties"][key], base["properties"]["candidates"]["items"]["properties"][key])
+            value = candidate["properties"]["value"]
+            self.assertEqual(value["type"], "string")
+            self.assertEqual(value["maxLength"], engine.MAX_QUOTE_BYTES)
+            names = set(branch["properties"]["name"]["enum"])
+            self.assertTrue(matched_names.isdisjoint(names))
+            matched_names.update(names)
+            if "pattern" in value:
+                self.assertEqual(names, {"occupancy_limit"})
+                self.assertEqual(value["pattern"], r"^[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+)?$")
+            else:
+                self.assertEqual(names, {"booking_label"})
+                self.assertNotIn("occupancy_limit", names)
+        self.assertEqual(matched_names, {field["name"] for field in fields})
+
+    def test_single_type_schema_uses_one_complete_grouped_object(self):
+        for value_type in ("text", "numeric"):
+            with self.subTest(value_type=value_type):
+                requested = engine.validate_extraction_request({
+                    "task_type": "field_extraction",
+                    "fields": [{"name": f"field_{i}", "question": f"What is field {i}?", "value_type": value_type}
+                               for i in range(3)],
+                })
+                schema = pipeline.response_schema(requested["fields"])
+                self.assertEqual(schema["properties"]["fields"]["maxItems"], engine.MAX_FIELDS)
+                items = schema["properties"]["fields"]["items"]
+                self.assertNotIn("anyOf", items)
+                self.assertEqual(items["type"], "object")
+                self.assertFalse(items["additionalProperties"])
+                self.assertEqual(items["properties"]["name"]["enum"], ["field_0", "field_1", "field_2"])
+                value = items["properties"]["candidates"]["items"]["properties"]["value"]
+                self.assertEqual("pattern" in value, value_type == "numeric")
+
+    def test_mixed_schema_groups_maximum_fields_into_only_two_branches(self):
+        fields = engine.validate_extraction_request({
+            "task_type": "field_extraction",
+            "fields": [{"name": f"field_{i}", "question": f"What is field {i}?",
+                        "value_type": "text" if i % 2 else "numeric"}
+                       for i in range(engine.MAX_FIELDS)],
+        })["fields"]
+        items = pipeline.response_schema(fields)["properties"]["fields"]["items"]
+        self.assertEqual(set(items), {"anyOf"})
+        self.assertEqual(len(items["anyOf"]), 2)
+        for branch in items["anyOf"]:
+            value = branch["properties"]["candidates"]["items"]["properties"]["value"]
+            value_type = "numeric" if "pattern" in value else "text"
+            self.assertEqual(branch["properties"]["name"]["enum"],
+                             [field["name"] for field in fields if field["value_type"] == value_type])
+
+    def test_numeric_schema_pattern_accepts_only_complete_literals(self):
+        fields = engine.validate_extraction_request(field_request("measurement", "numeric"))["fields"]
+        items = pipeline.response_schema(fields)["properties"]["fields"]["items"]
+        value_schema = items["properties"]["candidates"]["items"]["properties"]["value"]
+        pattern = value_schema["pattern"]
+        for literal in ("120", "45.50", "-2.50e1", "+.5", "-0.00", "1.", "1e+2", "2E-3"):
+            with self.subTest(literal=literal):
+                self.assertIsNotNone(re.search(pattern, literal))
+        for literal in ("120 people", "18 hours", "NaN", "Infinity", "1e", "1e+", "1e-", "1e.2",
+                        "number 120", "120 ", " 120", "--1", "+", ".", "1.2.3"):
+            with self.subTest(literal=literal):
+                self.assertIsNone(re.search(pattern, literal))
+
+    def test_mixed_extraction_preserves_numeric_literal_and_text_with_units(self):
+        fields = [
+            {"name": "measurement", "question": "What is the measurement?", "value_type": "numeric"},
+            {"name": "duration_label", "question": "What is the duration label?", "value_type": "text"},
+        ]
+        for literal, normalized in (("120", "120"), ("45.50", "45.50"), ("-2.50e1", "-25.0"), ("+.5", "0.5")):
+            with self.subTest(literal=literal):
+                quote = f"Measurement: {literal} units."
+                text_quote = "Duration label: 18 hours."
+                response = evidence_response(document(), name="measurement", value=literal, quote=quote)
+                response["fields"].extend(evidence_response(
+                    document(), name="duration_label", value="18 hours", quote=text_quote,
+                )["fields"])
+                adapter = CatalogAdapter(chunks=[chunk(document(), quote + " " + text_quote)])
+                client = StructuredClient({"task_type": "field_extraction", "fields": fields}, response)
+                with patch.object(engine, "validate_extraction_response", wraps=engine.validate_extraction_response) as validate:
+                    result, _, _ = self.run_request(
+                        "Extract measurement and duration_label from arrival-card.txt.", adapter=adapter, client=client,
+                    )
+                self.assertTrue(result["success"], result)
+                raw = validate.call_args_list[0].args[0]["fields"][0]["candidates"][0]["value"]
+                self.assertEqual(raw, literal)  # No stripping signs/zeros or JSON-number coercion.
+                self.assertIsInstance(raw, str)
+                self.assertEqual(result["fields"][0]["value"], normalized)
+                self.assertEqual(result["fields"][0]["quote"], quote)
+                self.assertEqual(result["fields"][1]["value"], "18 hours")
+                self.assertEqual(result["fields"][1]["quote"], text_quote)
+                self.assertFalse(result["execution_performed"])
+                self.assertEqual(result["evidence_validation"], pipeline.EVIDENCE_DISCLAIMER)
+                self.assertEqual(result["model_calls"], 2)
+                self.assertEqual([call["max_output_tokens"] for call in client.calls], [768, 1536])
+
+    def test_numeric_candidate_with_units_still_fails_closed_without_repair_or_retry(self):
+        for raw in ("120 people", "18 hours"):
+            with self.subTest(raw=raw):
+                quote = f"Capacity: {raw}."
+                response = evidence_response(document(), name="capacity", value=raw, quote=quote)
+                client = StructuredClient(field_request("capacity", "numeric"), response)
+                adapter = CatalogAdapter(chunks=[chunk(document(), quote)])
+                result, _, _ = self.run_request("Extract capacity from arrival-card.txt.", adapter=adapter, client=client)
+                self.assertEqual(result["status"], "invalid_evidence")
+                self.assertFalse(result["success"])
+                self.assertEqual(result["fields"][0]["status"], "invalid_evidence")
+                self.assertEqual(response["fields"][0]["candidates"][0]["value"], raw)
+                self.assertEqual(result["model_calls"], 2)
+                self.assertEqual(len(client.calls), 2)
+                self.assertEqual([call["max_output_tokens"] for call in client.calls], [768, 1536])
 
     def test_request_and_extraction_messages_exceeding_budget_are_not_sent_or_truncated(self):
         request = "Extract visitor from arrival-card.txt. " + "\n" * 6000
