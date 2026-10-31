@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Mapping, Sequence, TypeAlias
@@ -47,6 +48,16 @@ MAX_CANDIDATES = 4
 MAX_MODEL_RESPONSE_BYTES = 64 * 1024
 MAX_MODEL_INPUT_BYTES = 128 * 1024
 MAX_MODEL_CALLS = 2
+MAX_RAW_NUMERIC_BYTES = 128
+MAX_NORMALIZED_NUMERIC_BYTES = 256
+MAX_RESULT_BYTES = 96 * 1024
+
+_NUMERIC_LITERAL = re.compile(
+    r"(?<![A-Za-z0-9_.+-])"
+    r"[+-]?(?:(?:[0-9]+(?:\.[0-9]*)?)|(?:\.[0-9]+))"
+    r"(?:[eE][+-]?[0-9]+)?"
+    r"(?![A-Za-z0-9_.])"
+)
 
 
 class AnalysisError(ValueError):
@@ -524,6 +535,8 @@ def _raw_numeric(value: Any) -> tuple[str, Decimal]:
     raw = raw.strip()
     if not raw:
         raise EvidenceError("numeric evidence is empty")
+    if len(raw.encode("utf-8")) > MAX_RAW_NUMERIC_BYTES:
+        raise EvidenceError("numeric evidence token exceeds its size limit")
     try:
         decimal_value = Decimal(raw)
     except (InvalidOperation, ValueError):
@@ -533,10 +546,48 @@ def _raw_numeric(value: Any) -> tuple[str, Decimal]:
     return raw, decimal_value
 
 
+def _fixed_decimal_length(value: Decimal) -> int:
+    """Return fixed-point length without allocating the formatted value."""
+    if value == 0:
+        return 1
+    sign_length = 1 if value.as_tuple().sign else 0
+    digits_length = len(value.as_tuple().digits)
+    exponent = value.as_tuple().exponent
+    if exponent >= 0:
+        return sign_length + digits_length + exponent
+    integer_digits = digits_length + exponent
+    if integer_digits > 0:
+        return sign_length + digits_length + 1
+    return sign_length + 2 + (-integer_digits) + digits_length
+
+
 def _decimal_text(value: Decimal) -> str:
     if value == 0:
         return "0"
-    return format(value, "f")
+    if _fixed_decimal_length(value) > MAX_NORMALIZED_NUMERIC_BYTES:
+        raise EvidenceError("normalized numeric evidence exceeds its size limit")
+    # The expansion bound is checked before this potentially large allocation.
+    formatted = format(value, "f")
+    if len(formatted.encode("utf-8")) > MAX_NORMALIZED_NUMERIC_BYTES:
+        raise EvidenceError("normalized numeric evidence exceeds its size limit")
+    return formatted
+
+
+def _numeric_token_matches(raw_value: str, decimal_value: Decimal, quote: str) -> bool:
+    """Match only a complete quotation token with the same Decimal value."""
+    for match in _NUMERIC_LITERAL.finditer(quote):
+        token = match.group(0)
+        if len(token.encode("utf-8")) > MAX_RAW_NUMERIC_BYTES:
+            raise EvidenceError("quoted numeric token exceeds its size limit")
+        try:
+            token_decimal = Decimal(token)
+        except InvalidOperation:
+            continue
+        if not token_decimal.is_finite():
+            continue
+        if token == raw_value and decimal_value.compare(token_decimal) == Decimal(0):
+            return True
+    return False
 
 
 def _validate_candidate(
@@ -558,7 +609,7 @@ def _validate_candidate(
     value = candidate["value"]
     if field["value_type"] == "numeric":
         raw_value, decimal_value = _raw_numeric(value)
-        if raw_value not in quote:
+        if not _numeric_token_matches(raw_value, decimal_value, quote):
             raise EvidenceError(f"field {field['name']} value is not present in its quote")
         normalized_value: str | Any = _decimal_text(decimal_value)
     else:
@@ -613,7 +664,7 @@ def _missing_result(result: dict[str, Any], fields: Sequence[Mapping[str, str]],
     return result
 
 
-def analyze_document(
+def _analyze_document(
     document: DocumentIdentity | str,
     request: str,
     retrieve: RetrievalCallback,
@@ -730,6 +781,41 @@ def analyze_document(
     return result
 
 
+def _compact_result_overflow(result: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "version": VERSION,
+        "valid": False,
+        "success": False,
+        "status": "result_too_large",
+        "source": result.get("source"),
+        "extraction_request": None,
+        "fields": [],
+        "errors": [{"code": "result_too_large", "message": "analysis result exceeds its size limit."}],
+        "model_calls": result.get("model_calls", 0),
+        "evidence_validation": "structural_only; semantic_correctness_not_verified",
+    }
+
+
+def _finalize_result(result: dict[str, Any]) -> dict[str, Any]:
+    try:
+        encoded = json.dumps(result, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError):
+        return _compact_result_overflow(result)
+    if len(encoded) > MAX_RESULT_BYTES:
+        return _compact_result_overflow(result)
+    return result
+
+
+def analyze_document(
+    document: DocumentIdentity | str,
+    request: str,
+    retrieve: RetrievalCallback,
+    structured_llm: StructuredLLMCallback,
+) -> dict[str, Any]:
+    """Run bounded read-only field extraction and enforce result-size limits."""
+    return _finalize_result(_analyze_document(document, request, retrieve, structured_llm))
+
+
 __all__ = [
     "AnalysisError",
     "DocumentChunk",
@@ -740,6 +826,9 @@ __all__ = [
     "MAX_CANDIDATES",
     "MAX_CHUNKS",
     "MAX_FIELDS",
+    "MAX_NORMALIZED_NUMERIC_BYTES",
+    "MAX_RAW_NUMERIC_BYTES",
+    "MAX_RESULT_BYTES",
     "ModelOutputError",
     "ResolvedDocument",
     "RetrievalCallback",

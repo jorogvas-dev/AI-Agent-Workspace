@@ -47,6 +47,84 @@ def found(name, value, source, chunk_id, location, quote):
 
 
 class DocumentAnalysisV06aTests(unittest.TestCase):
+    def test_partial_numeric_literals_and_lost_signs_are_rejected(self):
+        request_output = request_for(field("measurement", "What is the measurement?", "numeric"))
+        for value, quote in (("1", "Measurement: 16.00 units."), ("1", "Measurement: -1 units."), ("1", "Measurement: 1e10 units.")):
+            with self.subTest(value=value, quote=quote):
+                response_output = response_for(found("measurement", value, "measurements.txt", "measurement-1", "line 1", quote))
+                callbacks = FakeCallbacks(
+                    request_output,
+                    response_output,
+                    [{"chunk_id": "measurement-1", "source": "measurements.txt", "location": "line 1", "text": quote}],
+                )
+                result = analysis.analyze_document("measurements.txt", "Extract the measurement.", callbacks.retrieve, callbacks.llm)
+                self.assertEqual(result["status"], "invalid_evidence")
+                self.assertFalse(result["success"])
+
+    def test_numeric_token_and_normalized_value_limits_are_fail_closed(self):
+        request_output = request_for(field("measurement", "What is the measurement?", "numeric"))
+        raw_too_long = "1" * (analysis.MAX_RAW_NUMERIC_BYTES + 1)
+        response_output = response_for(found("measurement", raw_too_long, "measurements.txt", "measurement-1", "line 1", raw_too_long))
+        callbacks = FakeCallbacks(
+            request_output,
+            response_output,
+            [{"chunk_id": "measurement-1", "source": "measurements.txt", "location": "line 1", "text": raw_too_long}],
+        )
+        result = analysis.analyze_document("measurements.txt", "Extract the measurement.", callbacks.retrieve, callbacks.llm)
+        self.assertEqual(result["status"], "invalid_evidence")
+
+        huge_exponent = "1e100000"
+        response_output = response_for(found("measurement", huge_exponent, "measurements.txt", "measurement-1", "line 1", huge_exponent))
+        callbacks = FakeCallbacks(
+            request_output,
+            response_output,
+            [{"chunk_id": "measurement-1", "source": "measurements.txt", "location": "line 1", "text": huge_exponent}],
+        )
+        result = analysis.analyze_document("measurements.txt", "Extract the measurement.", callbacks.retrieve, callbacks.llm)
+        self.assertEqual(result["status"], "invalid_evidence")
+        self.assertLessEqual(len(json.dumps(result, ensure_ascii=False).encode("utf-8")), analysis.MAX_RESULT_BYTES)
+
+    def test_signed_decimal_and_scientific_numeric_literals_are_accepted(self):
+        request_output = request_for(
+            field("signed_value", "What is the signed value?", "numeric"),
+            field("scientific_value", "What is the scientific value?", "numeric"),
+        )
+        response_output = response_for(
+            found("signed_value", "-16.00", "numbers.txt", "numbers-1", "line 2", "Signed value: -16.00"),
+            found("scientific_value", "1e3", "numbers.txt", "numbers-2", "line 3", "Scientific value: 1e3"),
+        )
+        callbacks = FakeCallbacks(
+            request_output,
+            response_output,
+            [
+                {"chunk_id": "numbers-1", "source": "numbers.txt", "location": "line 2", "text": "Signed value: -16.00"},
+                {"chunk_id": "numbers-2", "source": "numbers.txt", "location": "line 3", "text": "Scientific value: 1e3"},
+            ],
+        )
+        result = analysis.analyze_document("numbers.txt", "Extract both values.", callbacks.retrieve, callbacks.llm)
+        self.assertTrue(result["success"])
+        self.assertEqual(result["fields"][0]["value"], "-16.00")
+        self.assertEqual(result["fields"][1]["value"], "1000")
+
+    def test_result_serialization_overflow_returns_small_structured_error(self):
+        request_output = request_for(field("title", "What is the title?", "text"))
+        response_output = response_for(found("title", "Ready", "doc.txt", "doc-1", "line 1", "Title: Ready"))
+        callbacks = FakeCallbacks(
+            request_output,
+            response_output,
+            [{"chunk_id": "doc-1", "source": "doc.txt", "location": "line 1", "text": "Title: Ready"}],
+        )
+        original_limit = analysis.MAX_RESULT_BYTES
+        analysis.MAX_RESULT_BYTES = 256
+        try:
+            result = analysis.analyze_document("doc.txt", "Extract the title.", callbacks.retrieve, callbacks.llm)
+        finally:
+            analysis.MAX_RESULT_BYTES = original_limit
+        self.assertFalse(result["valid"])
+        self.assertFalse(result["success"])
+        self.assertEqual(result["status"], "result_too_large")
+        self.assertLess(len(json.dumps(result, ensure_ascii=False).encode("utf-8")), 1024)
+
     def test_unrelated_documents_support_arbitrary_sources_and_text_numeric_fields(self):
         alpha = analysis.DocumentIdentity("alpha-record.txt")
         alpha_fields = request_for(
