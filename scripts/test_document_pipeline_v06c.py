@@ -22,7 +22,7 @@ def document(source="registrations/arrival-card.txt", folder="input"):
 
 def field_request(name="visitor", value_type="text"):
     return {"task_type": "field_extraction", "fields": [
-        {"name": name, "question": f"What is the {name}?", "value_type": value_type},
+        {"name": name, "value_type": value_type},
     ]}
 
 
@@ -40,6 +40,16 @@ def chunk(selected, text="Visitor: Mira."):
         "folder": selected["folder"], "source": selected["source"],
         "chunk_id": "evidence-1", "location": "Section 3", "text": text,
     }
+
+
+def ranked_chunk(chunk_id, text=None):
+    return {**chunk(document(), text or f"Evidence for {chunk_id}."), "chunk_id": chunk_id}
+
+
+def requested_fields(count):
+    return {"task_type": "field_extraction", "fields": [
+        {"name": f"metric_{index}", "value_type": "text"} for index in range(count)
+    ]}
 
 
 class CatalogAdapter:
@@ -82,6 +92,17 @@ class StructuredClient:
         if isinstance(result, Exception):
             raise result
         return result if isinstance(result, str) else json.dumps(result)
+
+
+class RankedAdapter(CatalogAdapter):
+    def __init__(self, rankings):
+        super().__init__()
+        self.rankings = rankings
+
+    def search_document(self, query, *, folder, source, limit):
+        self.search_calls.append({"query": query, "folder": folder, "source": source, "limit": limit})
+        records = copy.deepcopy(self.rankings[len(self.search_calls) - 1])
+        return {"status": "success", "result_count": len(records), "results": records}
 
 
 class Response:
@@ -130,7 +151,7 @@ class DocumentPipelineV06cTests(unittest.TestCase):
                 self.assertFalse(result["execution_performed"])
                 self.assertEqual(result["evidence_validation"], pipeline.EVIDENCE_DISCLAIMER)
                 self.assertEqual(adapter.search_calls, [{
-                    "query": f"What is the {name}?", "folder": selected["folder"],
+                    "query": name.replace("_", " "), "folder": selected["folder"],
                     "source": selected["source"], "limit": 4,
                 }])
                 self.assertEqual(result["model_calls"], 2)
@@ -321,10 +342,188 @@ class DocumentPipelineV06cTests(unittest.TestCase):
         for call in client.calls:
             self.assertLessEqual(len(json.dumps(call["messages"], ensure_ascii=False, separators=(",", ":")).encode()), 16384)
 
+    def test_request_schema_and_runtime_gate_reject_planner_questions_and_assertions(self):
+        schema = pipeline.request_schema()
+        item = schema["properties"]["fields"]["items"]
+        self.assertEqual(set(item["properties"]), {"name", "value_type"})
+        self.assertEqual(set(item["required"]), {"name", "value_type"})
+        self.assertFalse(item["additionalProperties"])
+        for poison in ("$15.25", "37.5 hours", "$40"):
+            for key in ("question", "description", "answer"):
+                planning = field_request()
+                planning["fields"][0][key] = poison
+                result, adapter, client = self.run_request(client=StructuredClient(planning))
+                self.assertEqual(result["status"], "malformed_model_output")
+                self.assertIsNone(result["extraction_request"])
+                self.assertEqual(adapter.search_calls, [])
+                self.assertEqual(len(client.calls), 1)
+                self.assertNotIn(poison, json.dumps(result))
+        planning = field_request()
+        planning["debug"] = "Invented source claims"
+        result, adapter, client = self.run_request(client=StructuredClient(planning))
+        self.assertFalse(result["success"])
+        self.assertEqual(adapter.search_calls, [])
+        self.assertEqual(len(client.calls), 1)
+
+    def test_neutral_queries_and_engine_questions_use_only_validated_generic_labels(self):
+        labels = ["surface_color", "salinity-ppt", "supplier region"]
+        expected = ["surface color", "salinity ppt", "supplier region"]
+        planning = {"task_type": "field_extraction", "fields": [
+            {"name": name, "value_type": "text"} for name in labels
+        ]}
+        result, adapter, client = self.run_request(client=StructuredClient(
+            planning, {"task_type": "field_extraction", "fields": []},
+        ))
+        self.assertEqual(result["status"], "missing")
+        self.assertEqual([call["query"] for call in adapter.search_calls], expected)
+        questions = [f"What is the {label}?" for label in expected]
+        self.assertEqual([field["question"] for field in result["extraction_request"]["fields"]], questions)
+        extraction = json.loads(client.calls[1]["messages"][1]["content"])
+        self.assertEqual([field["question"] for field in extraction["fields"]], questions)
+        self.assertEqual(result["pipeline_version"], "0.6f")
+        self.assertEqual(result["version"], engine.VERSION)
+
+    def test_query_groups_are_deterministic_and_never_exceed_four_searches(self):
+        for count, queries in (
+            (1, ["metric 0"]),
+            (4, ["metric 0", "metric 1", "metric 2", "metric 3"]),
+            (5, ["metric 0 metric 4", "metric 1", "metric 2", "metric 3"]),
+            (8, ["metric 0 metric 4", "metric 1 metric 5", "metric 2 metric 6", "metric 3 metric 7"]),
+        ):
+            with self.subTest(count=count):
+                result, adapter, client = self.run_request(client=StructuredClient(
+                    requested_fields(count), {"task_type": "field_extraction", "fields": []},
+                ))
+                self.assertTrue(result["valid"])
+                self.assertEqual([call["query"] for call in adapter.search_calls], queries)
+                self.assertLessEqual(len(adapter.search_calls), 4)
+                self.assertTrue(all(call["limit"] == 4 for call in adapter.search_calls))
+                self.assertEqual(len(client.calls), 2)
+                self.assertEqual([call["max_output_tokens"] for call in client.calls], [768, 1536])
+
+    def test_round_robin_merge_caps_sixteen_candidates_at_eight_context_chunks(self):
+        rankings = [[ranked_chunk(f"query-{query}-rank-{rank}") for rank in range(4)] for query in range(4)]
+        adapter = RankedAdapter(rankings)
+        result, _, client = self.run_request(adapter=adapter, client=StructuredClient(
+            requested_fields(8), {"task_type": "field_extraction", "fields": []},
+        ))
+        self.assertTrue(result["valid"])
+        context = json.loads(client.calls[1]["messages"][1]["content"])["chunks"]
+        self.assertEqual([item["chunk_id"] for item in context],
+                         [f"query-{query}-rank-{rank}" for rank in range(2) for query in range(4)])
+        self.assertEqual(len(context), 8)
+        self.assertEqual(len(adapter.search_calls), 4)
+        self.assertEqual(sum(len(row) for row in rankings), 16)
+        self.assertTrue(all(call["limit"] == 4 for call in adapter.search_calls))
+
+    def test_identical_chunks_are_stably_deduplicated_across_ranked_searches(self):
+        rankings = [
+            [ranked_chunk(name) for name in ("shared", "a1", "a2", "a3")],
+            [ranked_chunk(name) for name in ("shared", "b1", "a2", "b3")],
+        ]
+        rankings[0][0]["distance"] = 0.1
+        rankings[1][0]["distance"] = 0.3  # Scores are query-specific, not content conflicts.
+        for _ in range(2):
+            adapter = RankedAdapter(rankings)
+            result, _, client = self.run_request(adapter=adapter, client=StructuredClient(
+                requested_fields(2), {"task_type": "field_extraction", "fields": []},
+            ))
+            self.assertTrue(result["valid"])
+            context = json.loads(client.calls[1]["messages"][1]["content"])["chunks"]
+            self.assertEqual([item["chunk_id"] for item in context], ["shared", "a1", "b1", "a2", "a3", "b3"])
+            self.assertEqual(len(context), 6)
+
+    def test_discarded_candidates_are_still_checked_for_conflicts_and_document_scope(self):
+        for failure in ("content", "location", "folder", "source"):
+            with self.subTest(failure=failure):
+                rankings = [[ranked_chunk(f"query-{query}-rank-{rank}") for rank in range(4)] for query in range(4)]
+                if failure in {"content", "location"}:
+                    rankings[3][3] = copy.deepcopy(rankings[0][3])
+                    rankings[3][3]["text" if failure == "content" else "location"] = "Conflicting evidence"
+                else:
+                    rankings[3][3][failure] = "knowledge" if failure == "folder" else "unselected.txt"
+                adapter = RankedAdapter(rankings)
+                result, _, client = self.run_request(adapter=adapter, client=StructuredClient(requested_fields(4)))
+                self.assertEqual(result["status"], "retrieval_error")
+                self.assertFalse(result["success"])
+                self.assertEqual(len(adapter.search_calls), 4)
+                self.assertEqual(len(client.calls), 1)
+
+    def test_every_response_requires_an_exact_success_count_and_per_search_bound(self):
+        good = {"status": "success", "result_count": 4, "results": [ranked_chunk(str(i)) for i in range(4)]}
+        invalid = [
+            {**good, "result_count": True}, {**good, "result_count": 3}, {**good, "result_count": None},
+            {"status": "success", "results": []}, {**good, "status": "empty"},
+            {"status": "success", "result_count": 5, "results": [ranked_chunk(str(i)) for i in range(5)]},
+        ]
+        for bad in invalid:
+            adapter = CatalogAdapter()
+            adapter.search_document = Mock(side_effect=[copy.deepcopy(good) for _ in range(3)] + [bad])
+            result, _, client = self.run_request(adapter=adapter, client=StructuredClient(requested_fields(4)))
+            self.assertEqual(result["status"], "retrieval_error")
+            self.assertEqual(adapter.search_document.call_count, 4)
+            self.assertEqual(len(client.calls), 1)
+
+    def test_rank_four_facts_with_tabs_newlines_and_previous_invented_values_are_genuine_evidence(self):
+        names = ["hourly_pay", "scheduled_hours", "daily_fee"]
+        values = ["15.25", "37.5", "40"]
+        quotes = ["Rate:\t$15.25\nper hour.", "Schedule:\n37.5\thours per week.", "Fee:\t$40\nper day."]
+        rankings, fields = [], []
+        for index, (name, value, quote) in enumerate(zip(names, values, quotes)):
+            fact = ranked_chunk(f"fact-{index}", quote)
+            rankings.append([ranked_chunk(f"boilerplate-{rank}") for rank in range(3)] + [fact])
+            field = evidence_response(document(), name=name, value=value, quote=quote)["fields"][0]
+            field["candidates"][0]["chunk_id"] = fact["chunk_id"]
+            fields.append(field)
+        planning = {"task_type": "field_extraction", "fields": [{"name": name, "value_type": "numeric"} for name in names]}
+        adapter = RankedAdapter(rankings)
+        result, _, client = self.run_request(adapter=adapter, client=StructuredClient(
+            planning, {"task_type": "field_extraction", "fields": fields},
+        ))
+        self.assertTrue(result["success"], result)
+        self.assertEqual([item["value"] for item in result["fields"]], values)
+        self.assertEqual([item["quote"] for item in result["fields"]], quotes)
+        self.assertEqual([call["query"] for call in adapter.search_calls], ["hourly pay", "scheduled hours", "daily fee"])
+        context = json.loads(client.calls[1]["messages"][1]["content"])["chunks"]
+        self.assertEqual([item["chunk_id"] for item in context], ["boilerplate-0", "boilerplate-1", "boilerplate-2", "fact-0", "fact-1", "fact-2"])
+        self.assertEqual(result["evidence_validation"], pipeline.EVIDENCE_DISCLAIMER)
+        self.assertFalse(result["execution_performed"])
+        for value in ("$15.25", "37.5", "$40"):
+            self.assertNotIn(value, json.dumps(adapter.search_calls))
+
+    def test_eight_selected_chunks_that_exceed_message_limit_are_not_truncated_or_generated(self):
+        rankings = [[ranked_chunk(f"query-{query}-rank-{rank}", "Evidence: " + "x" * 2200)
+                     for rank in range(4)] for query in range(4)]
+        adapter = RankedAdapter(rankings)
+        result, _, client = self.run_request(adapter=adapter, client=StructuredClient(requested_fields(4)))
+        self.assertEqual(result["status"], "model_input_too_large")
+        self.assertEqual(result["model_calls"], 1)
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(len(adapter.search_calls), 4)
+        self.assertTrue(all(item["text"] == "Evidence: " + "x" * 2200 for row in adapter.rankings for item in row))
+
+    def test_partial_results_and_exact_numeric_quote_validation_remain_authoritative(self):
+        planning = {"task_type": "field_extraction", "fields": [
+            {"name": "measurement", "value_type": "numeric"}, {"name": "label", "value_type": "text"},
+        ]}
+        quote = "Measurement:\t16.00\nunits."
+        for value, expected in (("16.00", "missing"), ("1", "invalid_evidence")):
+            response = evidence_response(document(), name="measurement", value=value, quote=quote)
+            response["fields"].append({"name": "label", "status": "missing", "candidates": []})
+            adapter = CatalogAdapter(chunks=[chunk(document(), quote)])
+            result, _, _ = self.run_request(adapter=adapter, client=StructuredClient(planning, response))
+            self.assertEqual(result["status"], expected)
+            self.assertFalse(result["success"])
+            if expected == "missing":
+                self.assertEqual(result["fields"][0]["status"], "found")
+                self.assertEqual(result["fields"][0]["value"], "16.00")
+                self.assertEqual(result["fields"][0]["quote"], quote)
+                self.assertEqual(result["fields"][1]["status"], "missing")
+
     def test_mixed_schema_sent_to_client_binds_numeric_names_to_numeric_branch(self):
         fields = [
-            {"name": "occupancy_limit", "question": "What is the occupancy limit?", "value_type": "numeric"},
-            {"name": "booking_label", "question": "What is the booking label?", "value_type": "text"},
+            {"name": "occupancy_limit", "value_type": "numeric"},
+            {"name": "booking_label", "value_type": "text"},
         ]
         planning = {"task_type": "field_extraction", "fields": fields}
         opener = Mock(side_effect=[Response({"choices": [{"message": {"content": json.dumps(output)}}]})
@@ -405,7 +604,9 @@ class DocumentPipelineV06cTests(unittest.TestCase):
                              [field["name"] for field in fields if field["value_type"] == value_type])
 
     def test_numeric_schema_pattern_accepts_only_complete_literals(self):
-        fields = engine.validate_extraction_request(field_request("measurement", "numeric"))["fields"]
+        fields = engine.validate_extraction_request({"task_type": "field_extraction", "fields": [{
+            "name": "measurement", "question": "What is the measurement?", "value_type": "numeric",
+        }]})["fields"]
         items = pipeline.response_schema(fields)["properties"]["fields"]["items"]
         value_schema = items["properties"]["candidates"]["items"]["properties"]["value"]
         pattern = value_schema["pattern"]
@@ -419,8 +620,8 @@ class DocumentPipelineV06cTests(unittest.TestCase):
 
     def test_mixed_extraction_preserves_numeric_literal_and_text_with_units(self):
         fields = [
-            {"name": "measurement", "question": "What is the measurement?", "value_type": "numeric"},
-            {"name": "duration_label", "question": "What is the duration label?", "value_type": "text"},
+            {"name": "measurement", "value_type": "numeric"},
+            {"name": "duration_label", "value_type": "text"},
         ]
         for literal, normalized in (("120", "120"), ("45.50", "45.50"), ("-2.50e1", "-25.0"), ("+.5", "0.5")):
             with self.subTest(literal=literal):

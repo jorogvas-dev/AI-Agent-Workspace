@@ -31,7 +31,7 @@ def document_result(status="success"):
         "quote": "Session label: 18 hours — début.",
     }
     result = {
-        "version": "0.6a", "pipeline_version": "0.6c", "status": status,
+        "version": "0.6a", "pipeline_version": "0.6f", "status": status,
         "valid": status != "unsupported_task_type", "success": status == "success",
         "source": selected["source"], "selected_document": selected,
         "extraction_request": {"task_type": "field_extraction", "fields": [
@@ -47,14 +47,21 @@ def document_result(status="success"):
         result["fields"] = [{"name": "capacity", "value_type": "numeric", "status": "missing"}, text]
         result["errors"] = [{"code": "missing_field", "message": "No verified candidate was returned.", "field": "capacity"}]
     elif status == "ambiguous":
-        other = {**numeric, "value": "150", "quote": "Capacity: 150 people.", "chunk_id": "capacity-2"}
+        candidate = {key: value for key, value in numeric.items() if key not in {"name", "status"}}
+        other = {**candidate, "value": "150", "quote": "Capacity: 150 people.", "chunk_id": "capacity-2"}
         result["fields"] = [{"name": "capacity", "value_type": "numeric", "status": "ambiguous",
-                             "candidates": [numeric, other]}, text]
+                             "candidates": [candidate, other]}, text]
         result["errors"] = [{"code": "ambiguous_field", "message": "No candidate was selected.", "field": "capacity"}]
     elif status == "unsupported_task_type":
         result.update({"fields": [], "extraction_request": None, "model_calls": 1,
                        "errors": [{"code": status, "message": "Only field extraction is supported."}]})
     return result
+
+
+def model_result(result):
+    """Expected public fixture: HTTP retains these two internal-only payloads."""
+    return {key: copy.deepcopy(value) for key, value in result.items()
+            if key not in {"extraction_request", "future_metadata"}}
 
 
 def legacy_result():
@@ -348,7 +355,7 @@ class DocumentAPIV06dTests(unittest.TestCase):
         ):
             with self.subTest(method=method):
                 actual = self.tool_call(method, expected)
-                self.assertEqual(actual, expected)
+                self.assertEqual(actual, expected if method == "analyze_with_planner" else model_result(expected))
                 request = self.transport.call_args.args[0]
                 self.assertEqual(request.full_url, endpoint)
                 self.assertEqual(request.get_method(), "POST")
@@ -362,11 +369,86 @@ class DocumentAPIV06dTests(unittest.TestCase):
         self.assertIn("job-offer calculation", tool.Tools.analyze_with_planner.__doc__)
         self.assertIn("text/numeric fields", tool.Tools.analyze_document.__doc__)
 
-    def test_tool_preserves_complete_generic_success_and_failure_results(self):
+    def test_tool_preserves_generic_results_but_omits_planning_metadata(self):
         for status in ("success", "missing", "ambiguous", "unsupported_task_type"):
             with self.subTest(status=status):
                 expected = document_result(status)
-                self.assertEqual(self.tool_call("analyze_document", expected), expected)
+                self.assertEqual(self.tool_call("analyze_document", expected), model_result(expected))
+
+    def test_http_retains_full_result_but_tool_never_exposes_poisoned_planning(self):
+        payload = document_result("missing")
+        payload["fields"] = [{"name": "capacity", "value_type": "numeric", "status": "missing"}]
+        expected = model_result(payload)
+        poisoned = copy.deepcopy(payload)
+        poisoned["extraction_request"]["fields"][0]["question"] = "Wage is $15.25"
+        poisoned["extraction_request"]["fields"][1]["question"] = "Schedule is 37.5 hours; fee is $40"
+        poisoned["planning"] = {"description": "Wage $15.25, 37.5 hours, fee $40"}
+        poisoned["debug"] = {"raw_model_output": poisoned["planning"]}
+        poisoned["fields"][0].update({"value": "15.25", "question": "Wage $15.25", "debug": "37.5 hours"})
+        self.generic.return_value = copy.deepcopy(poisoned)
+        handler = LocalHandler(self.planner_service)
+        handler.do_POST()
+        self.assertEqual(handler.status, 200)
+        self.assertEqual(handler.result(), poisoned)  # The service contract is deliberately unchanged.
+        actual = self.tool_call("analyze_document", handler.result())
+        self.assertEqual(actual, expected)
+        for text in ("$15.25", "37.5 hours", "$40", "extraction_request", "planning", "debug"):
+            self.assertNotIn(text, json.dumps(actual))
+        self.assertNotIn("value", actual["fields"][0])
+
+    def test_model_projection_preserves_real_verified_values_even_when_they_match_poisoned_numbers(self):
+        payload = document_result()
+        payload["fields"] = []
+        for name, value, quote in (
+            ("hourly_pay", "15.25", "Rate:\t$15.25\nper hour."),
+            ("scheduled_hours", "37.5", "Schedule:\n37.5\thours."),
+            ("daily_fee", "40", "Fee:\t$40\nper day."),
+        ):
+            payload["fields"].append({
+                "name": name, "status": "found", "value_type": "numeric", "value": value,
+                "source": payload["source"], "chunk_id": name, "location": "Section 2", "quote": quote,
+            })
+        payload["extraction_request"] = {"question": "Invented: $15.25, 37.5 hours, $40"}
+        actual = self.tool_call("analyze_document", payload)
+        self.assertEqual(actual["fields"], payload["fields"])
+        self.assertNotIn("extraction_request", actual)
+        self.assertNotIn("Invented", json.dumps(actual))
+        self.assertEqual(actual["pipeline_version"], "0.6f")
+        self.assertEqual(actual["evidence_validation"], payload["evidence_validation"])
+
+    def test_model_projection_preserves_partial_and_ambiguous_statuses_and_bounded_choices(self):
+        for status in ("missing", "ambiguous"):
+            with self.subTest(status=status):
+                payload = document_result(status)
+                payload["choices"] = [copy.deepcopy(payload["selected_document"])]
+                payload["choices_truncated"] = False
+                expected = model_result(payload)
+                poisoned = copy.deepcopy(payload)
+                poisoned["selected_document"]["debug"] = "internal planning"
+                poisoned["choices"][0]["question"] = "internal planning"
+                poisoned["errors"][0]["debug"] = "internal planning"
+                for field in poisoned["fields"]:
+                    field["question"] = "internal planning"
+                    if field["status"] == "ambiguous":
+                        field["value"] = "120"  # A candidate is not a settled answer.
+                        for candidate in field["candidates"]:
+                            candidate["debug"] = "internal planning"
+                actual = self.tool_call("analyze_document", poisoned)
+                self.assertEqual(actual, expected)
+                self.assertFalse(actual["success"])
+                self.assertEqual(actual["fields"][1]["status"], "found")
+                self.assertNotIn("internal planning", json.dumps(actual))
+                if status == "ambiguous":
+                    self.assertNotIn("value", actual["fields"][0])
+                    self.assertEqual(len(actual["fields"][0]["candidates"]), 2)
+        docstring = tool.Tools.analyze_document.__doc__
+        self.assertIn('status "found"', docstring)
+        self.assertIn("does not establish absence", docstring)
+        self.assertIn("not settled facts", docstring)
+
+    def test_legacy_tool_response_is_not_subject_to_document_projection(self):
+        expected = {**legacy_result(), "legacy_metadata": {"kept": True}, "extraction_request": {"legacy_fixture": "unchanged"}}
+        self.assertEqual(self.tool_call("analyze_with_planner", expected), expected)
 
     def test_generic_results_survive_combined_local_http_and_tool_boundary(self):
         def local_open(request, timeout):
@@ -381,7 +463,7 @@ class DocumentAPIV06dTests(unittest.TestCase):
         for status in ("success", "missing", "ambiguous", "unsupported_task_type"):
             expected = document_result(status)
             self.generic.return_value = copy.deepcopy(expected)
-            self.assertEqual(json.loads(tool.Tools().analyze_document(REQUEST)), expected)
+            self.assertEqual(json.loads(tool.Tools().analyze_document(REQUEST)), model_result(expected))
         self.assertEqual(self.generic.call_count, 4)
         self.legacy.assert_not_called()
 

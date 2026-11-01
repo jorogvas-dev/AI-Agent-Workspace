@@ -33,6 +33,47 @@ def _reject_constant(value):
     raise ValueError("non-standard JSON value")
 
 
+def _pick(value, keys):
+    if not isinstance(value, dict):
+        raise ValueError("invalid document result metadata")
+    return {key: value[key] for key in keys if key in value}
+
+
+def _document_result(payload):
+    """Expose result/evidence only, never planner questions or debug payloads."""
+    result = _pick(payload, (
+        "valid", "success", "status", "source", "version", "pipeline_version",
+        "execution_performed", "model_calls", "evidence_validation", "error",
+    ))
+    identity_keys = ("document_id", "folder", "source")
+    evidence_keys = ("value", "value_type", "source", "chunk_id", "location", "quote")
+    if "selected_document" in payload:
+        selected = payload["selected_document"]
+        result["selected_document"] = None if selected is None else _pick(selected, identity_keys)
+    for key in ("errors", "choices", "fields"):
+        if key in payload and not isinstance(payload[key], list):
+            raise ValueError("invalid document result metadata")
+    if "errors" in payload:
+        result["errors"] = [_pick(item, ("code", "message", "field")) for item in payload["errors"]]
+    if "choices" in payload:
+        result["choices"] = [_pick(item, identity_keys) for item in payload["choices"]]
+    if "choices_truncated" in payload:
+        result["choices_truncated"] = payload["choices_truncated"]
+    if "fields" in payload:
+        result["fields"] = []
+        for field in payload["fields"]:
+            projected = _pick(field, ("name", "value_type", "status"))
+            if field.get("status") == "found":
+                projected.update(_pick(field, evidence_keys))
+            elif field.get("status") == "ambiguous":
+                candidates = field.get("candidates", [])
+                if not isinstance(candidates, list):
+                    raise ValueError("invalid document candidates")
+                projected["candidates"] = [_pick(candidate, evidence_keys) for candidate in candidates]
+            result["fields"].append(projected)
+    return result
+
+
 def _call_planner(endpoint: str, user_request: str) -> str:
     unavailable = {"valid": False, "error": "planner API unavailable"}
     invalid = {"valid": False, "error": "request is invalid or too large"}
@@ -74,8 +115,12 @@ def _call_planner(endpoint: str, user_request: str) -> str:
         )
         if not isinstance(payload, dict):
             return json.dumps(unavailable)
+        # Validate the complete response before dropping internal-only keys;
+        # malformed Unicode must not become acceptable merely through projection.
         result = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
         result.encode("utf-8")
+        if endpoint == DOCUMENT_ENDPOINT:
+            result = json.dumps(_document_result(payload), ensure_ascii=False, separators=(",", ":"), allow_nan=False)
         return result
     except urllib.error.HTTPError as exc:
         exc.close()
@@ -99,5 +144,8 @@ class Tools:
 
         Forward the entire user request unchanged. Extraction is read-only;
         calculations, summaries, and other unsupported tasks are not executed.
+        Only fields with status "found" contain evidence-verified answers
+        (structural checks only). Missing extraction does not establish absence
+        from the document. Ambiguous candidates are not settled facts.
         """
         return _call_planner(DOCUMENT_ENDPOINT, user_request)
