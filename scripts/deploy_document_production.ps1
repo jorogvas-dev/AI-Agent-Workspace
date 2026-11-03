@@ -261,7 +261,7 @@ function Assert-MainMounts($Ui, $Knowledge, $Chroma, [string]$Root) {
   if ($db.Count -ne 1 -or $db[0].Type -ne 'bind' -or -not $db[0].RW -or
       [IO.Path]::GetFullPath($db[0].Source) -ine (Join-Path $Root 'knowledge-db') -or
       @($Chroma.Record.Mounts | Where-Object { $_.RW -and $_.Destination -ne '/data' }).Count) { Stop-Prod 'Chroma must use only the approved knowledge-db bind for persistent storage.' }
-  Assert-NoReparse (Join-Path $Root 'knowledge-db') -Tree
+  Assert-NoReparse (Join-Path $Root 'knowledge-db')
 }
 function Convert-ProdMount($Mount, $State, [string[]]$Tracked) {
   $result = [ordered]@{ type=$Mount.Type; target=$Mount.Destination; read_only=(-not $Mount.RW) }
@@ -328,7 +328,7 @@ function Assert-Storage($State) {
   if ($State.VolumeHash -and (Get-ObjectHash $volume) -cne $State.VolumeHash) { Stop-Prod 'WebUI volume was replaced or reconfigured.' }
   $db=Assert-ChildPath $State.DatabasePath $State.Root
   if ($db -ine (Join-Path $State.Root 'knowledge-db')) { Stop-Prod 'Refusing access to an unapproved database path.' }
-  Assert-NoReparse $db -Tree
+  Assert-NoReparse $db
   if (-not (Test-Path -LiteralPath $db -PathType Container)) { Stop-Prod 'Existing Chroma bind directory is missing.' }
   $null=Assert-Original $State 'chromadb'
   $volume
@@ -364,91 +364,279 @@ function Get-DataMount($State, [ValidateSet('webui','chroma')][string]$Target, [
   if (-not $Writable) { $mount+=',readonly' }
   $mount
 }
-function Assert-ArchiveListing([string[]]$Names, [string[]]$Kinds) {
-  if (-not $Names.Count -or $Names.Count -ne $Kinds.Count) { Stop-Prod 'Archive listing is incomplete or contains unsupported names.' }
-  $seen=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-  for ($index=0;$index -lt $Names.Count;$index++) {
-    $name=$Names[$index]
-    if (-not $name -or $name.StartsWith('/') -or $name -match '(^|/)\.\.(/|$)|[\\:\x00-\x1f]' -or
-        $Kinds[$index] -cnotmatch '^[-d]' -or -not $seen.Add($name.TrimEnd('/'))) {
-      Stop-Prod 'Unsafe archive: absolute/traversing/duplicate paths, links, or special entries are refused.'
-    }
-  }
+function Get-StorageProgram {
+@'
+import base64,collections,hashlib,json,os,re,stat,sys,tarfile
+LIMIT=64*1024*1024
+class UnsafeStorage(Exception): pass
+def need(condition,message):
+    if not condition: raise UnsafeStorage(message)
+def text(value):
+    need(type(value) is str and value and not any(ord(c)<32 or ord(c)==127 for c in value),'Unsupported path/target characters.')
+    value.encode('utf-8','strict')
+    need('\\' not in value and ':' not in value,'Unsupported path/target syntax.')
+    return value
+def member_name(value):
+    text(value); need(not value.startswith('/'),'Absolute archive member.')
+    if value.endswith('/'): value=value[:-1]
+    if value.startswith('./'): value=value[2:]
+    if value in ('','.'): return '.'
+    need(all(p not in ('','.','..') for p in value.split('/')),'Archive traversal or noncanonical member.')
+    return value
+def link_target(value):
+    text(value); need(not value.startswith('/'),'Absolute symbolic-link target.')
+    return value
+def graph(entries,required=None):
+    need(entries.get('.',{}).get('kind')=='d','Storage root must be a directory.')
+    resolutions={}
+    for path,record in entries.items():
+        if path=='.': continue
+        parts=path.split('/')
+        for n in range(1,len(parts)):
+            parent=entries.get('/'.join(parts[:n]),{})
+            need(parent.get('kind')=='d','Member beneath a symbolic link, non-directory or missing parent.')
+        if record['kind']!='l': continue
+        link_target(record['target'])
+        pending=collections.deque(parts); resolved=[]; active=set(); steps=0
+        while pending:
+            part=pending.popleft(); steps+=1
+            need(steps<=1000000,'Symbolic-link resolution exceeds the validation bound.')
+            if type(part) is tuple: active.remove(part[0]); continue
+            base='/'.join(resolved) or '.'
+            need(entries.get(base,{}).get('kind')=='d','Symbolic-link traversal through a non-directory.')
+            if part in ('','.'): continue
+            if part=='..':
+                need(bool(resolved),'Symbolic-link target escapes the storage root.'); resolved.pop(); continue
+            current='/'.join(resolved+[part]); item=entries.get(current)
+            need(item is not None,'Dangling symbolic link.')
+            if item['kind']=='l':
+                need(current not in active,'Cyclic symbolic link.')
+                active.add(current); target=link_target(item['target'])
+                pending.extendleft(reversed(target.split('/')+[(current,)]))
+            else: resolved.append(part)
+        resolutions[path]='/'.join(resolved) or '.'
+    if required:
+        record=entries.get(resolutions.get(required,required),{})
+        need(record.get('kind')=='f' and record.get('size',0)>0,'Required SQLite database is absent, non-file or empty.')
+    return entries
+def add(entries,path,record):
+    need(len(entries)<1000000,'Storage inventory exceeds its entry bound.')
+    entries[path]=record
+def scan(root,hash_files=True,required=None):
+    entries={}; budget=0
+    def put(path,record):
+        nonlocal budget
+        budget+=len(json.dumps([path,record],ensure_ascii=True).encode())
+        need(budget<=LIMIT,'Storage inventory exceeds 64 MiB.'); add(entries,path,record)
+    def same(a,b):
+        return (a.st_dev,a.st_ino,a.st_mode,a.st_size,a.st_mtime_ns)==(b.st_dev,b.st_ino,b.st_mode,b.st_size,b.st_mtime_ns)
+    def visit(fd,path):
+        need(stat.S_ISDIR(os.fstat(fd).st_mode),'Storage root/directory changed.')
+        put(path,dict(kind='d'))
+        for name in sorted(os.listdir(fd)):
+            text(name); need('/' not in name and name not in ('.','..'),'Invalid storage component.')
+            child=name if path=='.' else path+'/'+name
+            info=os.stat(name,dir_fd=fd,follow_symlinks=False)
+            if stat.S_ISLNK(info.st_mode):
+                target=os.readlink(name,dir_fd=fd)
+                need(same(info,os.stat(name,dir_fd=fd,follow_symlinks=False)),'Symbolic link changed during scan.')
+                put(child,dict(kind='l',target=target))
+            elif stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode):
+                flags=os.O_RDONLY|os.O_NOFOLLOW|(os.O_DIRECTORY if stat.S_ISDIR(info.st_mode) else 0)
+                item=os.open(name,flags,dir_fd=fd)
+                try:
+                    current=os.fstat(item); need(same(info,current),'Storage entry changed during scan.')
+                    if stat.S_ISDIR(info.st_mode): visit(item,child)
+                    else:
+                        need(current.st_nlink==1,'Hard links are unsupported.')
+                        record=dict(kind='f',size=current.st_size)
+                        if hash_files:
+                            digest=hashlib.sha256()
+                            while True:
+                                data=os.read(item,1024*1024)
+                                if not data: break
+                                digest.update(data)
+                            record['hash']=digest.hexdigest()
+                        need(same(current,os.fstat(item)) and os.fstat(item).st_nlink==1,'File changed during scan.')
+                        put(child,record)
+                finally: os.close(item)
+            else: raise UnsafeStorage('Special storage files are unsupported.')
+    fd=os.open(root,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+    try: visit(fd,'.')
+    finally: os.close(fd)
+    graph(entries,required)
+    return entries
+def pax(data,global_header):
+    result={}; offset=0
+    while offset<len(data):
+        space=data.find(b' ',offset)
+        need(space>offset and data[offset:space].isdigit(),'Invalid PAX record length.')
+        length=int(data[offset:space]); end=offset+length
+        need(end<=len(data) and end>space+1 and data[end-1:end]==b'\n','Incomplete PAX record.')
+        record=data[space+1:end-1]; need(b'=' in record,'Invalid PAX record.')
+        key,value=record.split(b'=',1); key=key.decode('ascii'); value=value.decode('utf-8','strict')
+        allowed={'comment'} if global_header else {'path','linkpath','mtime','atime','ctime','uid','gid','uname','gname'}
+        need(key in allowed and key not in result and '\0' not in value,'Unsupported or duplicate PAX key (including sparse/size overrides).')
+        if key in ('uid','gid'): need(value.isascii() and value.isdigit(),'Unsupported PAX owner.')
+        if key in ('mtime','atime','ctime'): need(re.fullmatch(r'-?[0-9]+(?:\.[0-9]+)?',value) is not None,'Unsupported PAX timestamp.')
+        result[key]=value; offset=end
+    return result
+def headers(path):
+    # Validate physical records as well as tarfile's effective members. No
+    # unknown/global path overrides, sparse files, hidden headers or tail data.
+    actual=0; pending=set(); pending_header=False; global_seen=False
+    with open(path,'rb') as stream:
+        while True:
+            block=stream.read(512); need(len(block)==512,'Truncated tar header/end marker.')
+            if block==bytes(512):
+                need(not pending_header and stream.read(512)==bytes(512),'Incomplete tar extensions/end marker.')
+                while True:
+                    tail=stream.read(1024*1024)
+                    if not tail: break
+                    need(len(tail)%512==0 and not any(tail),'Unsupported nonzero or partial tar trailer.')
+                return actual
+            need(block[257:263] in (b'ustar\0',b'ustar ',bytes(6)),'Unsupported tar format magic.')
+            info=tarfile.TarInfo.frombuf(block,'utf-8','strict'); size=info.size
+            need(size>=0,'Negative tar payload size.')
+            extension=info.type in (tarfile.XHDTYPE,tarfile.XGLTYPE,tarfile.GNUTYPE_LONGNAME,tarfile.GNUTYPE_LONGLINK)
+            if extension:
+                need(size<=65536,'Tar extension exceeds its validation bound.')
+                data=stream.read(size); need(len(data)==size,'Truncated tar extension.')
+                if info.type in (tarfile.XHDTYPE,tarfile.XGLTYPE):
+                    global_header=info.type==tarfile.XGLTYPE
+                    need(not global_header or (not global_seen and actual==0 and not pending_header),'Unsupported global PAX placement.')
+                    values=pax(data,global_header)
+                    if global_header: global_seen=True
+                    else:
+                        need(not pending.intersection(values),'Overlapping tar extensions.'); pending.update(values)
+                        pending_header=True
+                else:
+                    key='path' if info.type==tarfile.GNUTYPE_LONGNAME else 'linkpath'
+                    need(key not in pending and data.endswith(b'\0') and b'\0' not in data[:-1],'Invalid GNU long-name/link extension.')
+                    data[:-1].decode('utf-8','strict'); pending.add(key)
+                    pending_header=True
+            else:
+                need(info.type in (tarfile.REGTYPE,tarfile.AREGTYPE,tarfile.DIRTYPE,tarfile.SYMTYPE),'Hard links, special files and unsupported tar types are refused.')
+                need(info.type in (tarfile.REGTYPE,tarfile.AREGTYPE) or size==0,'Non-file tar payload is unsupported.')
+                stream.seek(size,1); actual+=1; pending.clear(); pending_header=False
+            padding=(-size)%512
+            need(stream.read(padding)==bytes(padding),'Invalid tar padding or truncated payload.')
+def archive(path,allow_links=True):
+    expected=headers(path); entries={'.':dict(kind='d')}; seen=set(); names=[]; budget=0
+    with tarfile.open(path,mode='r:',encoding='utf-8',errors='strict') as source:
+        for member in source:
+            key=member_name(member.name)
+            need(key not in seen,'Duplicate/aliased archive members.'); seen.add(key)
+            need(member.uid>=0 and member.gid>=0 and member.sparse is None,'Unsupported archive owner/sparse metadata.')
+            if member.type in (tarfile.REGTYPE,tarfile.AREGTYPE):
+                digest=hashlib.sha256(); length=0
+                with source.extractfile(member) as payload:
+                    while True:
+                        data=payload.read(1024*1024)
+                        if not data: break
+                        length+=len(data); digest.update(data)
+                need(length==member.size,'Incomplete archived file bytes.')
+                record=dict(kind='f',size=length,hash=digest.hexdigest())
+            elif member.type==tarfile.DIRTYPE: record=dict(kind='d')
+            elif member.type==tarfile.SYMTYPE:
+                need(allow_links,'Symbolic links in release source exports are unsupported.')
+                record=dict(kind='l',target=link_target(member.linkname))
+            else: raise UnsafeStorage('Unsupported effective tar member.')
+            budget+=len(json.dumps([key,record,member.name],ensure_ascii=True).encode())
+            need(budget<=LIMIT,'Archive inventory exceeds 64 MiB.'); add(entries,key,record)
+            names.append(member.name.rstrip('/')+'/' if record['kind']=='d' else member.name)
+    need(len(seen)==expected,'Tar member/header count mismatch.')
+    graph(entries)
+    return dict(names=names,entries=entries,files=sum(r['kind']=='f' for r in entries.values()),links=sum(r['kind']=='l' for r in entries.values()))
+def manifests(entries):
+    files=sorted(r['hash']+'  ./'+p for p,r in entries.items() if r['kind']=='f')
+    links=dict(links={'./'+p:r['target'] for p,r in entries.items() if r['kind']=='l'},directories=sorted(p for p,r in entries.items() if r['kind']=='d'))
+    return ((''.join(line+'\n' for line in files)).encode('utf-8'),(json.dumps(links,ensure_ascii=True,sort_keys=True,separators=(',',':'))+'\n').encode())
+def bounded_read(path):
+    with open(path,'rb') as stream: data=stream.read(LIMIT+1)
+    need(len(data)<=LIMIT,'Private inventory exceeds 64 MiB.'); return data
+def write_manifests(prefix,entries):
+    for suffix,data in zip(('.files','.links'),manifests(entries)):
+        need(len(data)<=LIMIT,'Private inventory exceeds 64 MiB.')
+        with open(prefix+suffix,'wb') as stream: stream.write(data)
+def run(config):
+    action=config['action']
+    if action=='scan':
+        entries=scan('/source',hash_files=bool(config.get('prefix')),required=config.get('required'))
+        if config.get('prefix'): write_manifests('/out/'+config['prefix'],entries)
+    else:
+        result=archive('/archive/'+config['archive'],allow_links=config['archive']!='release.tar')
+        if action=='archive':
+            # Keep POSIX case-sensitive path maps out of PowerShell 5.1's JSON
+            # object parser. Bind the entire validated inventory by digest.
+            inventory=json.dumps(result.pop('entries'),ensure_ascii=True,sort_keys=True,separators=(',',':')).encode()
+            result['inventory_hash']=hashlib.sha256(inventory).hexdigest()
+            data=json.dumps(result,ensure_ascii=True,sort_keys=True,separators=(',',':')).encode()
+            need(len(data)<=LIMIT,'Archive inventory exceeds 64 MiB.')
+            with open('/out/'+config['result'],'wb') as stream: stream.write(data)
+        elif action=='verify':
+            expected=manifests(result['entries'])
+            need(expected[0]==bounded_read('/archive/'+config['prefix']+'.files'),'Archived file contents differ from the cold source hashes.')
+            need(expected[1]==bounded_read('/archive/'+config['prefix']+'.links'),'Archived link targets/directories differ from the cold source inventory.')
+        else: raise UnsafeStorage('Unknown storage operation.')
+if __name__=='__main__':
+    try: run(json.loads(base64.b64decode(sys.argv[1])))
+    except Exception as error:
+        message=str(error) if isinstance(error,UnsafeStorage) else 'Storage scan/archive format could not be fully validated.'
+        print('PROD-STORAGE: '+message,file=sys.stderr); sys.exit(1)
+'@
+}
+function Get-StorageShellCode([string]$Action,$Parameters) {
+  $config=[ordered]@{action=$Action};foreach($key in $Parameters.Keys){$config[$key]=$Parameters[$key]}
+  $encoded=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((ConvertTo-Json $config -Compress)))
+  "python -B - '$encoded' <<'PROD_STORAGE_PY'`n"+(Get-StorageProgram)+"`nPROD_STORAGE_PY`n"
+}
+function Invoke-StorageOperation($State,[string[]]$Mounts,[string]$Action,$Parameters) {
+  try { $null=Invoke-Helper $State $Mounts (Get-StorageShellCode $Action $Parameters) }
+  catch { Stop-Prod "Storage $Action could not be completely validated; review relative-link resolution, hard/special entries and supported tar headers before retrying. No unsupported archive may be extracted." }
 }
 function Read-ArchiveMetadata($State, [string]$Path, [switch]$AllowEmpty) {
   $path=Assert-ChildPath $Path $State.Directory; Assert-NoReparse $path
   if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { Stop-Prod 'Backup/export archive is missing.' }
   $tag=[guid]::NewGuid().ToString('N'); $leaf=[IO.Path]::GetFileName($path)
   if($leaf -cnotmatch '^(release|cold-(webui|chroma)|failed-[a-f0-9]{32}-(webui|chroma))\.tar$'){Stop-Prod 'Unapproved archive filename.'}
-  $code="tar -tf /archive/$leaf > /out/$tag.names`ntar -tvf /archive/$leaf > /out/$tag.kinds"
-  $null=Invoke-Helper $State @("type=bind,source=$($State.Directory),target=/archive,readonly","type=bind,source=$($State.Directory),target=/out") $code
-  $namesPath=Join-Path $State.Directory "$tag.names"; $kindsPath=Join-Path $State.Directory "$tag.kinds"
-  foreach ($file in @($path,$namesPath,$kindsPath)) { Protect-ProdPath $file }
-  if ((Get-Item $namesPath).Length -gt 64MB -or (Get-Item $kindsPath).Length -gt 64MB) { Stop-Prod 'Archive inventory exceeds the reviewed bound.' }
-  $names=[IO.File]::ReadAllLines($namesPath,[Text.UTF8Encoding]::new($false,$true))
-  $kinds=[IO.File]::ReadAllLines($kindsPath,[Text.UTF8Encoding]::new($false,$true))
-  Assert-ArchiveListing $names $kinds
-  $files=@($kinds | Where-Object { $_.StartsWith('-') }).Count
+  $metadataPath=Join-Path $State.Directory "$tag.metadata"
+  Invoke-StorageOperation $State @("type=bind,source=$($State.Directory),target=/archive,readonly","type=bind,source=$($State.Directory),target=/out") 'archive' @{archive=$leaf;result="$tag.metadata"}
+  foreach ($file in @($path,$metadataPath)) { Protect-ProdPath $file }
+  if ((Get-Item $metadataPath).Length -gt 64MB) { Stop-Prod 'Archive inventory exceeds the reviewed bound.' }
+  try {$metadata=ConvertFrom-Json ([IO.File]::ReadAllText($metadataPath,[Text.UTF8Encoding]::new($false,$true))) -ErrorAction Stop}
+  catch {Stop-Prod 'Invalid fully validated archive inventory.'}
+  if(($metadata.files -isnot [int] -and $metadata.files -isnot [long]) -or $metadata.files -lt 0 -or
+    ($metadata.links -isnot [int] -and $metadata.links -isnot [long]) -or $metadata.links -lt 0 -or
+    $metadata.names -isnot [array] -or $metadata.inventory_hash -cnotmatch '^[a-f0-9]{64}$'){Stop-Prod 'Invalid validated archive counts/identity.'}
+  $files=$metadata.files
   if (-not $AllowEmpty -and $files -eq 0) { Stop-Prod 'Empty archive cannot establish a production baseline.' }
-  [pscustomobject]@{Path=$path;Hash=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash;NamesHash=(Get-FileHash $namesPath -Algorithm SHA256).Hash;
-    Files=$files;Names=@($names);Bytes=(Get-Item $path).Length}
+  [pscustomobject]@{Path=$path;Hash=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash;NamesHash=(Get-FileHash $metadataPath -Algorithm SHA256).Hash;
+    Files=$files;Links=$metadata.links;Names=@($metadata.names);Bytes=(Get-Item $path).Length}
 }
 function Assert-Archive($State, $Archive) {
   if(-not $Archive){Stop-Prod 'Missing verified archive.'}
   $null=Assert-ChildPath $Archive.Path $State.Directory;Assert-NoReparse $Archive.Path
   if ((Get-FileHash -LiteralPath $Archive.Path -Algorithm SHA256).Hash -cne $Archive.Hash) { Stop-Prod 'Archive hash mismatch; restoration/cutover is blocked.' }
   $check=Read-ArchiveMetadata $State $Archive.Path -AllowEmpty
-  if ($check.NamesHash -cne $Archive.NamesHash -or $check.Files -ne $Archive.Files) { Stop-Prod 'Archive contents changed or are incomplete.' }
+  if ($check.NamesHash -cne $Archive.NamesHash -or $check.Files -ne $Archive.Files -or $check.Links -ne $Archive.Links) { Stop-Prod 'Archive contents changed or are incomplete.' }
   if($Archive.Manifest){$null=Assert-ChildPath $Archive.Manifest $State.Directory;Assert-NoReparse $Archive.Manifest
-    if((Get-FileHash -LiteralPath $Archive.Manifest -Algorithm SHA256).Hash -cne $Archive.ManifestHash){Stop-Prod 'Backup file inventory hash mismatch.'}}
+    if((Get-FileHash -LiteralPath $Archive.Manifest -Algorithm SHA256).Hash -cne $Archive.ManifestHash){Stop-Prod 'Backup file inventory hash mismatch.'}
+    if(-not $Archive.LinkManifest){Stop-Prod 'Missing separate link inventory; do not restore an older/incomplete backup.'}
+    $null=Assert-ChildPath $Archive.LinkManifest $State.Directory;Assert-NoReparse $Archive.LinkManifest
+    if((Get-FileHash -LiteralPath $Archive.LinkManifest -Algorithm SHA256).Hash -cne $Archive.LinkManifestHash){Stop-Prod 'Backup link inventory hash mismatch.'}
+    Assert-TarFileHashes $State $Archive
+  }
 }
 function Assert-TarFileHashes($State,$Archive) {
-  # Independently compare the archived bytes to the quiescent source inventory.
-  # Stream uncompressed tar; no extra extracted copy or GNU-only tar flags.
+  # Verify bytes and symbolic-link targets independently; never dereference links.
   $null=Assert-ChildPath $Archive.Path $State.Directory;$null=Assert-ChildPath $Archive.Manifest $State.Directory
-  $expected=[Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
-  foreach($line in [IO.File]::ReadAllLines($Archive.Manifest,[Text.UTF8Encoding]::new($false,$true))){
-    if($line -cnotmatch '^([a-f0-9]{64})  (\./.+)$' -or $expected.ContainsKey($Matches[2])){Stop-Prod 'Invalid archive source inventory.'}
-    $expected.Add($Matches[2],$Matches[1])
-  }
-  $stream=[IO.File]::OpenRead($Archive.Path);$header=New-Object byte[] 512;$buffer=New-Object byte[] 1048576
-  $index=0;$files=0
-  try{
-    while($stream.Position -lt $stream.Length){
-      if($stream.Read($header,0,512) -ne 512){Stop-Prod 'Truncated tar header.'}
-      if($header[0] -eq 0){break}
-      if($header[124] -band 128){
-        [long]$size=$header[124] -band 127
-        for($n=125;$n -lt 136;$n++){
-          if($size -gt ([long]::MaxValue-$header[$n])/256){Stop-Prod 'Unsupported archive size.'}
-          $size=$size*256+$header[$n]
-        }
-      }else{
-        $octal=[Text.Encoding]::ASCII.GetString($header,124,12).Trim([char]0,[char]32)
-        if($octal -and $octal -cnotmatch '^[0-7]+$'){Stop-Prod 'Unsupported tar size encoding.'}
-        [long]$size=if($octal){[Convert]::ToInt64($octal,8)}else{0}
-      }
-      [long]$padding=(512-($size%512))%512
-      if($size -lt 0 -or $size+$padding -gt $stream.Length-$stream.Position){Stop-Prod 'Truncated tar payload.'}
-      $type=$header[156]
-      if($type -in @(76,75,120,103)){$stream.Position+=$size+$padding;continue} # GNU/PAX metadata, not file entries.
-      if($index -ge $Archive.Names.Count -or $type -notin @(0,48,53,55)){Stop-Prod 'Archive entry type/inventory mismatch.'}
-      $name=$Archive.Names[$index];$index++
-      if($type -eq 53){$stream.Position+=$size+$padding;continue}
-      if(-not $expected.ContainsKey($name)){Stop-Prod 'Archive contains an unexpected file.'}
-      $sha=[Security.Cryptography.SHA256]::Create()
-      try{
-        [long]$remaining=$size
-        while($remaining -gt 0){$read=$stream.Read($buffer,0,[int][Math]::Min($remaining,$buffer.Length));if($read -le 0){Stop-Prod 'Truncated archived file.'}
-          $null=$sha.TransformBlock($buffer,0,$read,$buffer,0);$remaining-=$read}
-        $null=$sha.TransformFinalBlock([byte[]]@(),0,0)
-        $actual=([BitConverter]::ToString($sha.Hash)).Replace('-','').ToLowerInvariant()
-        if($actual -cne $expected[$name]){Stop-Prod 'Archived file contents differ from the cold source hashes.'}
-      }finally{$sha.Dispose()}
-      $stream.Position+=$padding;$files++
-    }
-    if($index -ne $Archive.Names.Count -or $files -ne $expected.Count){Stop-Prod 'Archive omitted source entries.'}
-  }finally{$stream.Dispose()}
+  $null=Assert-ChildPath $Archive.LinkManifest $State.Directory
+  $leaf=[IO.Path]::GetFileName($Archive.Path);$prefix=[IO.Path]::GetFileNameWithoutExtension($leaf)
+  if($leaf -cnotmatch '^(cold|failed-[a-f0-9]{32})-(webui|chroma)\.tar$' -or
+    [IO.Path]::GetFileName($Archive.Manifest) -cne "$prefix.files" -or
+    [IO.Path]::GetFileName($Archive.LinkManifest) -cne "$prefix.links"){Stop-Prod 'Unapproved archive/file/link inventory names.'}
+  Invoke-StorageOperation $State @("type=bind,source=$($State.Directory),target=/archive,readonly") 'verify' @{archive=$leaf;prefix=$prefix}
 }
 function Assert-Quiescent($State) {
   foreach ($name in $State.Originals.PSObject.Properties.Name) {
@@ -466,14 +654,19 @@ function New-ColdBackup($State, [string]$Target, [string]$Prefix, [switch]$Allow
   Assert-Quiescent $State
   $mount=Get-DataMount $State $Target
   $leaf="$Prefix-$Target.tar"; $manifest="$Prefix-$Target.files"
-  $code="cd /source`nfind . ! -type f ! -type d -print > /out/unsupported`nfind . -type f -links +1 -print >> /out/unsupported`ntest ! -s /out/unsupported`ntar -cpf /out/$leaf .`nfind . -type f -exec sha256sum {} \; | LC_ALL=C sort > /out/$manifest"
+  $parameters=@{prefix="$Prefix-$Target"}
+  if(-not $AllowEmpty){$parameters.required=if($Target -eq 'webui'){'webui.db'}else{'chroma.sqlite3'}}
+  $code=(Get-StorageShellCode 'scan' $parameters)+"`ncd /source`ntar -cpf /out/$leaf ."
   $null=Invoke-Helper $State @($mount,"type=bind,source=$($State.Directory),target=/out") $code
   $archive=Read-ArchiveMetadata $State (Join-Path $State.Directory $leaf) -AllowEmpty:$AllowEmpty
   $manifestPath=Join-Path $State.Directory $manifest; Protect-ProdPath $manifestPath
+  $linksPath=Join-Path $State.Directory "$Prefix-$Target.links";Protect-ProdPath $linksPath
   $fileLines=[IO.File]::ReadAllLines($manifestPath,[Text.UTF8Encoding]::new($false,$true))
   if ($fileLines.Count -ne $archive.Files -or @($fileLines | Where-Object { $_ -cnotmatch '^[a-f0-9]{64}  \./' }).Count) { Stop-Prod 'Cold-backup file inventory is incomplete.' }
   $archive | Add-Member -NotePropertyName Manifest -NotePropertyValue $manifestPath
   $archive | Add-Member -NotePropertyName ManifestHash -NotePropertyValue (Get-FileHash $manifestPath -Algorithm SHA256).Hash
+  $archive | Add-Member -NotePropertyName LinkManifest -NotePropertyValue $linksPath
+  $archive | Add-Member -NotePropertyName LinkManifestHash -NotePropertyValue (Get-FileHash $linksPath -Algorithm SHA256).Hash
   Assert-TarFileHashes $State $archive
   if (-not $AllowEmpty) {
     $required=if($Target -eq 'webui'){'./webui.db'}else{'./chroma.sqlite3'}
@@ -874,7 +1067,7 @@ function Invoke-ProdPrepare([string]$Commit) {
   foreach($target in @('webui','chroma')){
     $mount=Get-DataMount $state $target
     $required=if($target -eq 'webui'){'webui.db'}else{'chroma.sqlite3'}
-    $null=Invoke-Helper $state @($mount) "cd /source`ntest -s $required`ntest -z `"`$(find . ! -type f ! -type d -print)`"`ntest -z `"`$(find . -type f -links +1 -print)`""
+    Invoke-StorageOperation $state @($mount) 'scan' @{required=$required}
   }
   Export-ProdRelease $state $tracked
   Write-ProdOverride $state $privateRecords['open-webui'] $privateRecords['knowledge-service'] $tracked
@@ -969,17 +1162,18 @@ function Restore-ColdData($State,[string]$Target,$Archive) {
   if(-not $State.FailedState.Count){Stop-Prod 'Verified failed-state preservation must precede data restoration.'}
   $mount=Get-DataMount $State $Target -Writable
   $leaf=[IO.Path]::GetFileName($Archive.Path);$manifest=[IO.Path]::GetFileName($Archive.Manifest)
-  if($manifest -cne "cold-$Target.files"){Stop-Prod 'Unapproved restore inventory filename.'}
+  $links=[IO.Path]::GetFileName($Archive.LinkManifest)
+  if($manifest -cne "cold-$Target.files" -or $links -cne "cold-$Target.links"){Stop-Prod 'Unapproved restore file/link inventory filename.'}
   $code=@'
 cd /source
 # The mount, stopped writers, archive paths/types, hash and failed-state backup
 # have already been verified. Delete entries only inside this exact data mount.
 find . -mindepth 1 -maxdepth 1 -exec rm -rf -- {} \;
 tar -xpf /archive/ARCHIVE -C /source
-find . -type f -exec sha256sum {} \; | LC_ALL=C sort > /out/restored.files
-cmp /out/restored.files /archive/MANIFEST
 '@
-  $null=Invoke-Helper $State @($mount,"type=bind,source=$($State.Directory),target=/archive,readonly","type=bind,source=$($State.Directory),target=/out") ($code.Replace('ARCHIVE',$leaf).Replace('MANIFEST',$manifest))
+  $code=$code.Replace('ARCHIVE',$leaf)+"`n"+(Get-StorageShellCode 'scan' @{prefix='restored'})+
+    "`ncmp /out/restored.files /archive/$manifest`ncmp /out/restored.links /archive/$links"
+  $null=Invoke-Helper $State @($mount,"type=bind,source=$($State.Directory),target=/archive,readonly","type=bind,source=$($State.Directory),target=/out") $code
 }
 function Invoke-ProdRollback($State,[switch]$RestoreData) {
   if($RestoreData){Assert-HelperCapabilities $State}

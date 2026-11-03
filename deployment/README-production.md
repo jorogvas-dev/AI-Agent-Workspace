@@ -90,14 +90,35 @@ CR to LF, then passes those bytes to `['sh', '-s']`, retaining the `set -eu`
 prefix. This includes Windows PowerShell's appended terminal CRLF and multiline
 shell constructs; UTF-8 content is preserved. Shell stdout/stderr are inherited
 and its exit code is propagated without extra bootstrap output. No host shell
-interpolation, installation, image change or pull is involved; the existing helper sandbox and
-mount restrictions remain in force. The conservative archive
-policy supports regular files/directories, including dotfiles; **links, hardlinks,
-special entries, duplicate paths, and traversal names are refused**. If cache or
-data contains links, obtain a separately reviewed backup implementation; do not
-delete or flatten cache/data to bypass this gate. Custom startup/device settings
+interpolation, installation, image change or pull is involved; the existing
+helper sandbox and mount restrictions remain in force.
+
+Storage preflight, cold/failed-state backup verification and post-restore checks
+share a Python validator inside that same cached helper. It supports regular
+files, directories (including hidden/cache directories), and **relative symbolic
+links whose complete resolution stays inside the same approved storage root**.
+It never follows links while scanning, hashing or archiving. Directory/file
+descriptors use no-follow opens; links retain their original target text. Link
+chains and directory aliases are checked against the complete inventory.
+Absolute/escaping targets, dangling/cyclic links, hard-linked regular files,
+special files, scan errors and members beneath a link or non-directory abort.
+The approved storage root and its host ancestors must still be free of reparse
+points; internal links are checked inside the Linux helper. Do not delete,
+exclude or flatten cache/data to bypass validation. Custom startup/device settings
 also require review. Existing read-only tracked source mounts are redirected to
 the identical path in the exported release; other supported mounts are retained.
+
+Archive validation checks physical tar checksums, end markers/padding, effective
+member names/types, duplicate/aliased paths, explicit directory parents and all
+link targets **before extraction**, independent of member order. Supported input
+is uncompressed ordinary tar, GNU long-name/link extensions, and a conservative
+PAX subset: path/linkpath, ordinary timestamps and owner metadata; the initial
+global comment used by Git exports is accepted. Sparse files, PAX size/global
+path overrides, xattrs/unknown extensions, malformed/truncated archives and
+nonzero trailing data fail closed. Names/targets must be valid UTF-8 without
+ASCII control characters, backslashes or colons. Private inventories remain bounded
+to 64 MiB, with entry/link-resolution bounds; unvalidated formats/layouts require
+separate review. This does not certify every possible cache layout.
 
 ## Explicit actions
 
@@ -144,7 +165,11 @@ that digest/count and retaining non-reset positive chunk/file counts.
 Cutover rechecks IDs/configuration, disables restart and stops all historical
 duplicates, then stops canonical UI/knowledge and the same Chroma. Only when all
 writers are stopped does the cached helper create complete cold tar archives
-and per-file SHA-256 inventories. It has no network, a read-only source, a
+and per-file SHA-256 inventories plus separate `.links` inventories of exact
+link paths/targets and directories. Both inventories are hashed into recovery
+state and compared against the validated archive. The whole storage tree is
+retained using tar without dereferencing links or excluding caches. It has no
+network, a read-only source, a
 read-only root filesystem, and only the required data/output mounts. Archive
 contents/types, database presence, counts and hashes must verify before renaming
 canonical UI/knowledge to unique backups. Those backups remain stopped with
@@ -213,7 +238,10 @@ writers including Chroma first stop; verified failed-state archives of **both**
 targets are retained before any restore. Cold archive hashes, inventory hashes,
 entry paths/types and exact volume/bind identities are checked again. Extraction
 only targets the existing `open-webui` volume and exact `knowledge-db` bind;
-post-restore file hashes must match. Originals then regain their names and exact
+the existing `tar -xpf` ownership/mode handling is retained. A fresh no-follow
+scan must match **both** regular-file hashes and exact link targets/directory
+inventories after restoration. Older/incomplete cold backups without the
+separate hashed link inventory are refused. Originals then regain their names and exact
 restart policies; Chroma starts before knowledge/UI. Without `-RestoreData`, the
 current data is retained, so review application/schema compatibility explicitly.
 
@@ -240,6 +268,12 @@ import/catalog probes execute in a standard-library harness with HTTP, Chroma
 and `runpy` fakes and networking blocked. The actual helper bootstrap is tested
 with subprocess execution mocked, covering newline bytes, UTF-8 shell text,
 exit codes, inherited output and unchanged sandbox arguments; no real shell runs.
+Storage tests execute the shared validator against synthetic tar bytes and a
+virtual POSIX filesystem, including cache links, link chains, GNU/PAX metadata,
+traversal, altered targets/bytes and failed-state/rollback orchestration. They
+do not perform a real Linux tar extraction, test live ownership restoration,
+access production storage, or establish that its current links all satisfy the
+policy. No Windows symbolic-link privilege is needed; fixtures remain retained.
 The default interpreter is the existing workspace
 `.venv/Scripts/python.exe`; pass `-PythonExecutable '<existing-python-path>'` to
 select another installed interpreter. No dependency installation is performed.

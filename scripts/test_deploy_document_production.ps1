@@ -61,6 +61,161 @@ if case.get('mode')=='helper-bootstrap':
         result=dict(ok=True,exit_code=exit_code,calls=calls,stdout=stdout.getvalue(),stderr=stderr.getvalue())
     except Exception as exc: result=dict(ok=False,error=type(exc).__name__)
     print(json.dumps(result)); sys.exit(0)
+if case.get('mode')=='storage':
+    import copy,stat,tarfile
+    namespace={'__name__':'synthetic_storage'}
+    exec(compile(case['code'],'<production-storage>','exec'),namespace)
+    fault=case.get('fault'); Unsafe=namespace['UnsafeStorage']
+    nodes={'.':dict(kind='d'),'.cache':dict(kind='d'),'.cache/blobs':dict(kind='d'),
+        '.cache/blobs/hash':dict(kind='f',data=b'cached bytes'),'.cache/snapshots':dict(kind='d'),
+        '.cache/snapshots/rev':dict(kind='d'),'.cache/snapshots/rev/config.json':dict(kind='l',target='../../blobs/hash'),
+        'webui.db':dict(kind='f',data=b'synthetic database'),'.hidden':dict(kind='f',data=b'hidden bytes')}
+    link='.cache/snapshots/rev/config.json'
+    if fault=='escape': nodes[link]['target']='../../../outside'
+    if fault=='absolute': nodes[link]['target']='/etc/passwd'
+    if fault=='dangling': nodes[link]['target']='../../blobs/missing'
+    if fault=='cycle': nodes[link]['target']='config.json'
+    if fault=='indirect-cycle':
+        nodes[link]['target']='other'; nodes['.cache/snapshots/rev/other']=dict(kind='l',target='config.json')
+    if fault=='parent-escape':
+        nodes[link]['target']='../../alias/../../../outside'; nodes['.cache/alias']=dict(kind='l',target='blobs')
+    if fault=='hard': nodes['hard']=dict(kind='h',target='webui.db',data=b'synthetic database')
+    if fault in ('special','block'): nodes['fifo']=dict(kind='s',block=fault=='block')
+    if fault in ('under-link','under-link-first'):
+        nodes['.cache/alias']=dict(kind='l',target='blobs'); nodes['.cache/alias/child']=dict(kind='f',data=b'unsafe')
+    if fault=='chain':
+        nodes[link]['target']='../../alias/hash'; nodes['.cache/alias']=dict(kind='l',target='blobs')
+    if fault in ('long','gnu-long'):
+        name='long-'+('x'*110); nodes['.cache/blobs/'+name]=dict(kind='f',data=b'long target'); nodes[link]['target']='../../blobs/'+name
+    if fault=='metadata':
+        nodes['A']=dict(kind='f',data=b'uppercase'); nodes['a']=dict(kind='f',data=b'lowercase')
+    if fault=='linked-db':
+        nodes['database-real']=nodes['webui.db']; nodes['webui.db']=dict(kind='l',target='database-real')
+    if fault=='db-empty': nodes['webui.db']['data']=b''
+    if fault=='db-missing': del nodes['webui.db']
+    if fault=='db-directory': nodes['webui.db']=dict(kind='d')
+    class VirtualStorage:
+        O_RDONLY=0; O_NOFOLLOW=1; O_DIRECTORY=2
+        def __init__(self,records): self.records=records; self.fds={}; self.next=0
+        def key(self,name,fd): return name if self.fds[fd][0]=='.' else self.fds[fd][0]+'/'+name
+        def info(self,key):
+            r=self.records[key]; kinds={'d':stat.S_IFDIR,'f':stat.S_IFREG,'h':stat.S_IFREG,'l':stat.S_IFLNK,'s':stat.S_IFIFO}
+            return types.SimpleNamespace(st_mode=(stat.S_IFBLK if r.get('block') else kinds[r['kind']])|0o750,st_dev=1,st_ino=sorted(self.records).index(key)+1,
+                st_size=len(r.get('data',r.get('target','').encode())),st_mtime_ns=123,st_nlink=2 if r['kind']=='h' else 1)
+        def open(self,name,flags,dir_fd=None):
+            assert flags & self.O_NOFOLLOW
+            if dir_fd is None: assert name=='/source'; key='.'
+            else: key=self.key(name,dir_fd)
+            assert self.records[key]['kind'] in ('d','f','h'), 'never dereference a symbolic link'
+            if flags & self.O_DIRECTORY: assert self.records[key]['kind']=='d'
+            self.next+=1; self.fds[self.next]=[key,0]; return self.next
+        def close(self,fd): del self.fds[fd]
+        def fstat(self,fd): return self.info(self.fds[fd][0])
+        def stat(self,name,*,dir_fd,follow_symlinks): assert follow_symlinks is False; return self.info(self.key(name,dir_fd))
+        def readlink(self,name,*,dir_fd): return self.records[self.key(name,dir_fd)]['target']
+        def listdir(self,fd):
+            root=self.fds[fd][0]; prefix='' if root=='.' else root+'/'
+            return [key[len(prefix):] for key in self.records if key!='.' and key.startswith(prefix) and '/' not in key[len(prefix):]]
+        def read(self,fd,size):
+            key,offset=self.fds[fd]; data=self.records[key]['data'][offset:offset+size]; self.fds[fd][1]+=len(data); return data
+    def scanned(records):
+        namespace['os']=VirtualStorage(records)
+        try: return namespace['scan']('/source',required='webui.db')
+        finally: namespace['os']=os
+    tar_path=Path(sys.argv[1]).with_suffix('.tar')
+    def make_tar(records,format=tarfile.USTAR_FORMAT):
+        output=io.BytesIO()
+        with tarfile.open(fileobj=output,mode='w',format=format,pax_headers={'comment':'synthetic commit'} if fault=='global-comment' else None) as archive:
+            for key,r in sorted(records.items(),reverse=fault=='under-link-first'):
+                item=tarfile.TarInfo('.' if key=='.' else './'+key); item.uid=1000; item.gid=1001; item.mode=0o750
+                if fault=='unknown-pax': item.pax_headers={'SCHILY.xattr.synthetic':'unsupported'}
+                if fault=='global-path': item.pax_headers={'size':'1'}
+                if fault=='pax-time': item.mtime=123.125
+                if fault=='pax-escape' and key=='.hidden': item.pax_headers={'path':'../escape'}
+                if fault=='pax-under-link' and key=='.hidden': item.pax_headers={'path':'./.cache/snapshots/rev/config.json/child'}
+                if fault=='pax-link-escape' and key==link: item.pax_headers={'linkpath':'/absolute'}
+                if r['kind']=='d': item.type=tarfile.DIRTYPE
+                elif r['kind']=='l': item.type=tarfile.SYMTYPE; item.linkname=r['target']
+                elif r['kind']=='h': item.type=tarfile.LNKTYPE; item.linkname=r['target']
+                elif r['kind']=='s': item.type=tarfile.BLKTYPE if r.get('block') else tarfile.FIFOTYPE
+                else: item.size=len(r['data'])
+                archive.addfile(item,io.BytesIO(r['data']) if r['kind']=='f' else None)
+            if fault in ('duplicate','traversal','absolute-member','backslash-member'):
+                name={'duplicate':'./webui.db','traversal':'../escape','absolute-member':'/absolute','backslash-member':'./bad\\path'}[fault]
+                archive.addfile(tarfile.TarInfo(name),io.BytesIO(b''))
+        data=output.getvalue()
+        if fault=='trailer': data+=b'X'*512
+        if fault=='truncated': data=data[:513]
+        if fault=='checksum': data=bytes([data[0]^1])+data[1:]
+        tar_path.write_bytes(data)
+    try:
+        scan_error=None; archive_error=None
+        try: source=scanned(nodes)
+        except Unsafe as exc: scan_error=str(exc)
+        format=tarfile.GNU_FORMAT if fault=='gnu-long' else tarfile.PAX_FORMAT if fault in ('long','unknown-pax','global-path','global-comment','pax-time','pax-escape','pax-under-link','pax-link-escape') else tarfile.USTAR_FORMAT
+        make_tar(nodes,format)
+        try: result=namespace['archive'](str(tar_path))
+        except (Unsafe,tarfile.TarError,ValueError) as exc: archive_error=type(exc).__name__
+        if fault in ('escape','absolute','dangling','cycle','indirect-cycle','parent-escape','hard','special','block','under-link','under-link-first','unknown-pax','global-path','trailer','truncated','checksum','duplicate','traversal','absolute-member','backslash-member','pax-escape','pax-under-link','pax-link-escape','db-empty','db-missing','db-directory'):
+            print(json.dumps(dict(ok=True,scan_rejected=scan_error is not None,archive_rejected=archive_error is not None))); sys.exit(0)
+        assert scan_error is None and archive_error is None
+        preflight=VirtualStorage(nodes)
+        preflight.read=lambda *args: (_ for _ in ()).throw(AssertionError('preflight must not read regular bytes'))
+        namespace['os']=preflight
+        try: namespace['scan']('/source',hash_files=False,required='webui.db')
+        finally: namespace['os']=os
+        expected=namespace['manifests'](source)
+        assert expected==namespace['manifests'](result['entries'])
+        # Reconstruct only synthetic regular bytes and exact link metadata from
+        # the validated archive; no host symbolic links or real tar commands.
+        restored={}
+        with tarfile.open(tar_path,mode='r:') as archive:
+            for item in archive:
+                key=namespace['member_name'](item.name)
+                assert (item.uid,item.gid,item.mode)==(1000,1001,0o750)
+                if item.isdir(): restored[key]=dict(kind='d')
+                elif item.issym(): restored[key]=dict(kind='l',target=item.linkname)
+                else: restored[key]=dict(kind='f',data=archive.extractfile(item).read())
+        assert restored[link]['target']==nodes[link]['target']
+        def restored_manifests():
+            captured=[]; namespace['os']=VirtualStorage(restored)
+            namespace['write_manifests']=lambda prefix,entries: captured.append((prefix,namespace['manifests'](entries)))
+            try: namespace['run'](dict(action='scan',prefix='restored'))
+            finally: namespace['os']=os
+            assert len(captured)==1 and captured[0][0]=='/out/restored'
+            return captured[0][1]
+        assert restored_manifests()==expected
+        original_archive=namespace['archive']
+        namespace['archive']=lambda path,allow_links=True: original_archive(str(tar_path),allow_links)
+        namespace['bounded_read']=lambda path: expected[0 if path.endswith('.files') else 1]
+        namespace['run'](dict(action='verify',archive='cold-webui.tar',prefix='cold-webui'))
+        if fault=='alter-target':
+            nodes[link]['target']='./../../blobs/hash'; make_tar(nodes)
+            changed=original_archive(str(tar_path))
+            assert namespace['manifests'](changed['entries'])[0]==expected[0]
+            try: namespace['run'](dict(action='verify',archive='cold-webui.tar',prefix='cold-webui'))
+            except Unsafe as exc: assert 'link targets' in str(exc)
+            else: raise AssertionError('altered archive target accepted')
+            restored[link]['target']='./../../blobs/hash'
+            assert restored_manifests()[1]!=expected[1] and restored_manifests()[0]==expected[0]
+        if fault=='file-hash':
+            nodes['.hidden']['data']=b'altered file'; make_tar(nodes)
+            try: namespace['run'](dict(action='verify',archive='cold-webui.tar',prefix='cold-webui'))
+            except Unsafe as exc: assert 'file contents' in str(exc)
+            else: raise AssertionError('altered file bytes accepted')
+            restored['.hidden']['data']=b'altered file'
+            assert restored_manifests()[0]!=expected[0]
+        if fault=='metadata':
+            metadata_path=Path(sys.argv[1]).with_suffix('.metadata')
+            namespace['open']=lambda path,*args,**kwargs: open(metadata_path if path=='/out/synthetic.metadata' else path,*args,**kwargs)
+            namespace['run'](dict(action='archive',archive='cold-webui.tar',result='synthetic.metadata'))
+            metadata=json.loads(metadata_path.read_bytes())
+            assert set(metadata)=={'names','files','links','inventory_hash'}
+            print(json.dumps(dict(ok=True,archive_path=str(tar_path),metadata=metadata,
+                files_base64=base64.b64encode(expected[0]).decode(),links_base64=base64.b64encode(expected[1]).decode()))); sys.exit(0)
+        print(json.dumps(dict(ok=True,files=result['files'],links=result['links'],target=restored[link]['target']))); sys.exit(0)
+    except SystemExit: raise
+    except Exception as exc: print(json.dumps(dict(ok=False,error=type(exc).__name__,detail=str(exc)))); sys.exit(0)
 calls=[]; output=io.StringIO(); result=None; ok=False; error=None
 fault=case.get('fault'); size=case.get('size',53); mode=case.get('mode','catalog')
 docs=[]
@@ -274,7 +429,8 @@ $script:orchestration=@{
   'Assert-ProductionNetworks'={param($State,[switch]$Create) $script:events.Add('production-network')}
   'New-ColdBackup'={param($State,$Target,$Prefix,[switch]$AllowEmpty)
     Assert-Quiescent $State;$script:events.Add("backup:$Prefix/$Target")
-    [pscustomobject]@{Path=(Join-Path $State.Directory "$Prefix-$Target.tar");Hash='hash';NamesHash='names';Files=1;Names=@('./db');Manifest=(Join-Path $State.Directory "$Prefix-$Target.files");ManifestHash='manifest'}
+    [pscustomobject]@{Path=(Join-Path $State.Directory "$Prefix-$Target.tar");Hash='hash';NamesHash='names';Files=1;Links=0;Names=@('./db');Manifest=(Join-Path $State.Directory "$Prefix-$Target.files");ManifestHash='manifest';
+      LinkManifest=(Join-Path $State.Directory "$Prefix-$Target.links");LinkManifestHash='links'}
   }
   'Assert-Archive'={param($State,$Archive) $script:events.Add('verify:'+([IO.Path]::GetFileName($Archive.Path)));if($script:failArchive){Stop-Prod 'Archive hash mismatch.'}}
   'Invoke-Helper'={param($State,$Mounts,$Code)
@@ -282,6 +438,7 @@ $script:orchestration=@{
       Assert-Test ($State.FailedState.Count -gt 0) 'failed-state backup precedes extraction'
       Assert-Test ($Mounts[0] -in @('type=volume,source=open-webui,target=/source','type=bind,source=E:\AI-Agent-Workspace\knowledge-db,target=/source')) 'restore mount stays exact'
       Assert-Test ($Code.Contains('cmp /out/restored.files /archive/')) 'restore file hashes checked'
+      Assert-Test ($Code.Contains('cmp /out/restored.links /archive/')) 'restore exact link targets/directories checked separately'
       $script:events.Add('restore-data');if($script:failRestore){Stop-Prod 'Synthetic extraction failure.'}
     }
   }
@@ -462,12 +619,74 @@ Test-Case 'unknown replacement occupant is never stopped or removed' {
     Assert-Test ($script:events.Count -eq $before) 'unknown occupant untouched'
   }
 }
-Test-Case 'safe archive listings include hidden files and refuse traversal links duplicates and special entries' {
-  Assert-ArchiveListing @('./','./.hidden','./db') @('drwx','-rw','-rw')
-  foreach($names in @(@('../escape'),@('/absolute'),@('C:/escape'),@('./x/../../escape'),@('./bad\path'),@('./x','./x'))){
-    $null=Expect-Failure {Assert-ArchiveListing $names @($names | ForEach-Object {'-rw'})} 'Unsafe archive'
+Test-Case 'cache-style relative links survive archive and synthetic restore without dereferencing' {
+  foreach($fault in @('valid','chain','long','gnu-long','global-comment','pax-time','linked-db')){
+    $check=Invoke-SyntheticProbe (Get-StorageProgram) -Mode storage -Fault $fault
+    Assert-Test $check.ok "validated storage/archive/restored inventory for $fault ($($check.detail))"
+    Assert-Test ($check.files -ge 3 -and $check.links -ge 1) 'all files, hidden entries and exact link metadata preserved'
   }
-  foreach($kind in @('lrwx','hrw','brw')){$null=Expect-Failure {Assert-ArchiveListing @('./link') @($kind)} 'Unsafe archive'}
+}
+Test-Case 'escaping absolute dangling cyclic hard and special storage entries fail closed' {
+  foreach($fault in @('escape','absolute','dangling','cycle','indirect-cycle','parent-escape','hard','special','block')){
+    $check=Invoke-SyntheticProbe (Get-StorageProgram) -Mode storage -Fault $fault
+    Assert-Test ($check.ok -and $check.scan_rejected -and $check.archive_rejected) "$fault rejected in both source scan and archive"
+  }
+}
+Test-Case 'required SQLite database must resolve to a present nonempty regular file' {
+  foreach($fault in @('db-empty','db-missing','db-directory')){
+    $check=Invoke-SyntheticProbe (Get-StorageProgram) -Mode storage -Fault $fault
+    Assert-Test ($check.ok -and $check.scan_rejected) "$fault cannot pass cold-storage preflight"
+  }
+}
+Test-Case 'archive members beneath links traversal duplicates and unsupported formats are rejected before extraction' {
+  foreach($fault in @('under-link','under-link-first','duplicate','traversal','absolute-member','backslash-member','unknown-pax','global-path','pax-escape','pax-under-link','pax-link-escape','trailer','truncated','checksum')){
+    $check=Invoke-SyntheticProbe (Get-StorageProgram) -Mode storage -Fault $fault
+    Assert-Test ($check.ok -and $check.archive_rejected) "unsafe or incompletely validated archive $fault rejected"
+  }
+}
+Test-Case 'altered link spelling is detected independently of regular bytes before and after restore' {
+  $check=Invoke-SyntheticProbe (Get-StorageProgram) -Mode storage -Fault alter-target
+  Assert-Test $check.ok "exact targets checked independently ($($check.detail))"
+}
+Test-Case 'cold backup wiring binds separate link manifests and validates them before any restore' {
+  $script:storageFixture=Invoke-SyntheticProbe (Get-StorageProgram) -Mode storage -Fault metadata
+  Assert-Test $script:storageFixture.ok "synthetic metadata emitted by actual validator ($($script:storageFixture.detail))"
+  $s=New-TestState;$script:storageVerifyCalls=0;$script:storageQuiescentCalls=0
+  With-Mocks @{
+    'Assert-Quiescent'={param($State) $script:storageQuiescentCalls++}
+    'Protect-ProdPath'={param($Path)}
+    'Get-DataMount'={param($State,$Target,[switch]$Writable) 'type=volume,source=open-webui,target=/source,readonly'}
+    'Invoke-Helper'={param($State,$Mounts,$Code)
+      Assert-Test ($script:storageQuiescentCalls -gt 0 -and $Mounts[0].EndsWith(',readonly')) 'quiescence and read-only source precede backup'
+      $match=[regex]::Match($Code,"python -B - '([A-Za-z0-9+/=]+)' <<'PROD_STORAGE_PY'")
+      Assert-Test $match.Success 'backup scans the whole storage tree using the shared validator'
+      $parameters=ConvertFrom-Json ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($match.Groups[1].Value)))
+      Assert-Test ($parameters.action -ceq 'scan' -and $parameters.prefix -ceq 'cold-webui' -and $parameters.required -ceq 'webui.db') 'source file/link inventories captured before tar'
+      Assert-Test ($Code.IndexOf('PROD_STORAGE_PY') -lt $Code.IndexOf('tar -cpf /out/cold-webui.tar .') -and
+        $Code -notmatch 'tar (-h|--dereference)|--exclude') 'whole archive includes caches and never dereferences/excludes links'
+      [IO.File]::WriteAllBytes((Join-Path $State.Directory 'cold-webui.tar'),[IO.File]::ReadAllBytes($script:storageFixture.archive_path))
+      [IO.File]::WriteAllBytes((Join-Path $State.Directory 'cold-webui.files'),[Convert]::FromBase64String($script:storageFixture.files_base64))
+      [IO.File]::WriteAllBytes((Join-Path $State.Directory 'cold-webui.links'),[Convert]::FromBase64String($script:storageFixture.links_base64))
+    }
+    'Invoke-StorageOperation'={param($State,$Mounts,$Action,$Parameters)
+      Assert-Test ($Mounts[0] -ceq "type=bind,source=$($State.Directory),target=/archive,readonly") 'archive verification remains read-only and narrowly mounted'
+      if($Action -ceq 'archive'){
+        [IO.File]::WriteAllText((Join-Path $State.Directory $Parameters.result),(ConvertTo-Json $script:storageFixture.metadata -Depth 20 -Compress),[Text.UTF8Encoding]::new($false))
+      }elseif($Action -ceq 'verify'){
+        $script:storageVerifyCalls++
+        Assert-Test ($Mounts.Count -eq 1 -and $Parameters.archive -ceq 'cold-webui.tar' -and $Parameters.prefix -ceq 'cold-webui') 'file/link manifests verified against the exact cold archive'
+      }else{throw 'TEST: unexpected storage operation'}
+    }
+  } {
+    $archive=New-ColdBackup $s webui cold
+    Assert-Test ($archive.Links -eq 1 -and $archive.Files -eq 5 -and $archive.Names -ccontains './A' -and $archive.Names -ccontains './a') 'case-sensitive POSIX entries survive PowerShell metadata handling'
+    Assert-Test ($archive.LinkManifestHash -ceq (Get-FileHash -LiteralPath $archive.LinkManifest -Algorithm SHA256).Hash) 'separate link inventory hash bound into recovery record'
+    Assert-Archive $s $archive
+    $verified=$script:storageVerifyCalls
+    [IO.File]::AppendAllText($archive.LinkManifest,'synthetic alteration')
+    $null=Expect-Failure {Assert-Archive $s $archive} 'link inventory hash mismatch'
+    Assert-Test ($script:storageVerifyCalls -eq $verified) 'tampered link manifest aborts before restore/source access'
+  }
 }
 Test-Case 'exact storage path guards reject computed paths outside the approved root' {
   $null=Expect-Failure {Assert-ChildPath 'E:\elsewhere\knowledge-db' 'E:\AI-Agent-Workspace'} 'escapes'
@@ -642,18 +861,8 @@ Test-Case 'actual archive-hash mismatch blocks helper access before extraction' 
   }
 }
 Test-Case 'streamed archived file bytes must match the cold source hashes including dotfiles' {
-  $s=New-TestState;$path=Join-Path $scratch 'cold-webui.tar';$manifest=Join-Path $scratch 'cold-webui.files'
-  $payload=[Text.Encoding]::UTF8.GetBytes('synthetic bytes');$header=New-Object byte[] 512
-  $name=[Text.Encoding]::ASCII.GetBytes('./.hidden');[Array]::Copy($name,0,$header,0,$name.Length)
-  $size=[Text.Encoding]::ASCII.GetBytes([Convert]::ToString($payload.Length,8).PadLeft(11,'0')+[char]0)
-  [Array]::Copy($size,0,$header,124,12);$header[156]=48
-  $stream=[IO.MemoryStream]::new()
-  try{$stream.Write($header,0,512);$stream.Write($payload,0,$payload.Length);$pad=New-Object byte[] (512-$payload.Length+1024);$stream.Write($pad,0,$pad.Length);[IO.File]::WriteAllBytes($path,$stream.ToArray())}finally{$stream.Dispose()}
-  [IO.File]::WriteAllText($manifest,(Get-TextHash 'synthetic bytes')+"  ./.hidden`n",[Text.UTF8Encoding]::new($false))
-  $archive=[pscustomobject]@{Path=$path;Manifest=$manifest;Names=@('./.hidden')}
-  Assert-TarFileHashes $s $archive
-  $bytes=[IO.File]::ReadAllBytes($path);$bytes[512]=0;[IO.File]::WriteAllBytes($path,$bytes)
-  $null=Expect-Failure {Assert-TarFileHashes $s $archive} 'contents differ'
+  $check=Invoke-SyntheticProbe (Get-StorageProgram) -Mode storage -Fault file-hash
+  Assert-Test $check.ok "archive and restored regular-file bytes verified ($($check.detail))"
 }
 Test-Case 'Git export sends binary archive to output file and retains all tracked runtime files' {
   $s=New-TestState;$s.Release=Join-Path $scratch 'synthetic-release'
