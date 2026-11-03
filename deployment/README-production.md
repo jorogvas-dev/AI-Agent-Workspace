@@ -1,14 +1,18 @@
-# Production document-analysis adoption (preparation only)
+# Production document-analysis deployment and acceptance
 
-This tooling has not deployed or cleaned up production. Application runtime is
+Production is operator-reported deployed and awaiting explicit acceptance (see
+the checkpoint below). This tooling change was validated offline only; no live
+acceptance or cleanup was performed while implementing it. Application runtime is
 the reviewed `scripts.document_service_production` and standalone
 `tools/analyze_document_production.py`; pipeline version remains **0.6i**.
 Use Windows PowerShell **5.1** and the observed Compose **5.6.1**. Review and
 commit the runtime first. Supply its full expected HEAD explicitly; the helper
-requires tracked working-tree/index cleanliness and exports **the entire tracked
+requires tracked working-tree/index cleanliness for **Prepare** and exports **the entire tracked
 commit** with `git archive --output`. Untracked files, including local test
 fixtures, do not enter the release. No builds, pulls, deployment-time installs,
 or working-tree application source binds are permitted.
+Accept uses the existing state's pinned commit/release; it does not require a new
+Prepare, matching current HEAD, or another Cutover.
 
 The managed project is `agent-production`, with exactly `open-webui`,
 `knowledge-service`, and `document-planner-prod`. Chroma remains the **same
@@ -220,6 +224,66 @@ production acceptance should a separate reviewed cleanup plan be considered.
 This helper has no cleanup, pruning, volume/network removal, test-stack removal,
 or old-source deletion action.
 
+### Explicit guarded acceptance
+
+Operator checkpoint reported on **2026-11-04**: deployment is at
+`ReadyForOperatorAcceptance`, commit
+`e9b29343507162e04d299a653ce100b15076927e`. Production UI checks passed for PDF
+extraction with evidence, a missing field remaining missing without fabrication,
+and an absent document returning `document_not_found` with the UI waiting for
+selection. These are operator-reported results, not a claim of universal
+document support or a substitute for the remaining applicable checks above.
+
+After completing the operator checks, use the updated helper against the exact
+recorded state. This command is documentation only; it has not been executed as
+part of this change:
+
+```powershell
+$state = 'E:\AI-Agent-Workspace\runtime\production\private\20261104-000408-cddc9ce1\state.json'
+& .\scripts\deploy_document_production.ps1 -Action Accept -StatePath $state
+& .\scripts\deploy_document_production.ps1 -Action Status -StatePath $state
+```
+
+Accept supports existing schema-1 `ReadyForOperatorAcceptance` records without
+redeployment. Before mutation it revalidates the pinned release/private hashes,
+all three recorded replacement IDs/fingerprints and configuration, existing
+network identities, storage/writers, readiness/authentication/data gates and
+dormant backups. Network validation cannot create a network or save state.
+Maintain the freeze on concurrent Docker/Compose/configuration changes throughout
+acceptance. No application/model/tool settings or secret values are changed.
+
+It retains protected `compose.before-accept.json` and `compose.accepted.json`
+recovery copies, then checkpoints an **Accepting** journal with their old/new
+hashes before changing the private `compose.json` override. Only the three
+service `restart` properties become `unless-stopped`; the recorded Compose
+template, immutable release and all other override settings remain intact.
+The override is replaced atomically and its integrity hash is updated in state.
+No Compose `up`, recreation, Cutover, stop/start, backup activation or cleanup is
+performed. The override policies take precedence over the template's initial
+`restart: "no"` when using the recorded Compose configuration.
+
+Live `docker container update --restart=unless-stopped` targets precisely the
+recorded `open-webui`, `knowledge-service` and `document-planner-prod` IDs, with
+identity/readiness checks before updates and exact policy readback afterward.
+Original/historical policies and Chroma's captured policy are untouched.
+**Accepted** and its UTC timestamp are recorded only after the persisted config,
+integrity hash, all three live policies and final readiness checks succeed.
+
+If interrupted, retain the state and recovery files and repeat **Accept with the
+same StatePath**. `Accepting` permits only the journal's exact old/new override
+hashes and a mixture of `no`/`unless-stopped` live policies. It reconciles a config
+commit interrupted before its hash checkpoint and skips policies already set.
+Unexpected identities, settings, policies, hashes or occupied recovery files
+abort; never repair them by editing hashes, switching StatePath or rerunning
+Cutover. Repeating Accept after `Accepted` performs revalidation without further
+policy/config/state changes. Missing or changed recovery copies must be resolved
+explicitly; the helper never invents acceptance history or replaces unknown data.
+
+Readiness requires `no` before acceptance, permits the expected mixed policies
+only while `Accepting`, and requires all three `unless-stopped` policies after
+`Accepted`. Status still reports recorded state rather than fresh live readiness.
+Keep recovery artifacts and dormant backups; any cleanup requires its own review.
+
 ## Rollback and partial failures
 
 ```powershell
@@ -231,7 +295,9 @@ or old-source deletion action.
 
 Rollback uses recorded IDs, fingerprints, ownership/run/commit labels, phase,
 and exact restart policies. It handles originals not yet renamed and partially
-created replacements. Only verified replacements are stopped/removed, without
+created replacements, including `Accepting` and `Accepted` states. Replacement
+restart is disabled before removal, and originals regain their originally
+captured policies rather than the replacements' accepted policies. Only verified replacements are stopped/removed, without
 volume removal. Historical duplicates remain stopped and restart-disabled.
 Unknown occupants abort instead of being overwritten. With `-RestoreData`, all
 writers including Chroma first stop; verified failed-state archives of **both**
@@ -274,6 +340,12 @@ traversal, altered targets/bytes and failed-state/rollback orchestration. They
 do not perform a real Linux tar extraction, test live ownership restoration,
 access production storage, or establish that its current links all satisfy the
 policy. No Windows symbolic-link privilege is needed; fixtures remain retained.
+Acceptance tests use synthetic private configurations and mocked containers,
+covering schema-1 compatibility, policy/config/hash persistence, idempotency,
+interrupted config commits and policy updates, failed readbacks, identity drift,
+read-only prerequisites and rollback after acceptance. They do not read the
+reported live StatePath or real credentials, operate Docker/Git, or prove live
+policy/readiness success. Operator acceptance must still be run explicitly.
 The default interpreter is the existing workspace
 `.venv/Scripts/python.exe`; pass `-PythonExecutable '<existing-python-path>'` to
 select another installed interpreter. No dependency installation is performed.

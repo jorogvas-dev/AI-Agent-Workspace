@@ -1,7 +1,7 @@
 # Windows PowerShell 5.1. Importing/dot-sourcing defines functions only.
 [CmdletBinding()]
 param(
-  [ValidateSet('Prepare','Cutover','Status','Rollback')][string]$Action,
+  [ValidateSet('Prepare','Cutover','Accept','Status','Rollback')][string]$Action,
   [string]$ExpectedCommit,
   [string]$StatePath,
   [switch]$RestoreData
@@ -859,10 +859,11 @@ print(json.dumps({name:sorted({x[4][0] for x in socket.getaddrinfo(name,None,soc
 }
 function Assert-ReplacementConfiguration($State) {
   $images=Get-ProdImages; $roles=@{'open-webui'='webui';'knowledge-service'='knowledge';'document-planner-prod'='planner'}
+  $policies=if($State.Phase -ceq 'Accepted'){@('unless-stopped')}elseif($State.Phase -ceq 'Accepting'){@('no','unless-stopped')}else{@('no')}
   foreach($name in $roles.Keys){
     $current=Get-Replacement $State $name
     if(-not $current.Raw.State.Running -or $current.Record.Image -cne $images[$roles[$name]] -or
-      (Get-RestartArgument $current.Record.RestartPolicy) -cne 'no'){Stop-Prod 'Replacement image/state/restart policy mismatch.'}
+      (Get-RestartArgument $current.Record.RestartPolicy) -cnotin $policies){Stop-Prod 'Replacement image/state/restart policy mismatch.'}
     $expected=@($State.ExpectedMounts.$name)
     if($current.Record.Mounts.Count -ne $expected.Count){Stop-Prod 'Replacement mount count changed.'}
     foreach($mount in $expected){
@@ -926,8 +927,69 @@ function Assert-Release($State) {
     (Get-ReleaseHash $State.Release) -cne $State.ReleaseHash){Stop-Prod 'Pinned release content/path changed.'}
   foreach($file in @('webui.env','knowledge.env','agent_knowledge_token','document_planner_prod_token','compose.json','compose.yml','empty.env')){
     $path=Join-Path $State.Directory $file;Protect-ProdPath $path
-    if((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -cne $State.PrivateHashes.$file){Stop-Prod 'Prepared private configuration changed; do not cut over.'}
+    $actual=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+    $expectedHash=$State.PrivateHashes.$file
+    if($file -ceq 'compose.json' -and $State.Phase -ceq 'Accepting'){
+      Assert-AcceptanceJournal $State
+      # The replacement can commit before its new hash reaches state.json.
+      if($expectedHash -ceq $State.Acceptance.FromHash -and $actual -ceq $State.Acceptance.ToHash){continue}
+    }
+    if($actual -cne $expectedHash){Stop-Prod 'Prepared private configuration changed; do not cut over.'}
   }
+}
+function Assert-AcceptanceJournal($State) {
+  $journal=Get-Field $State 'Acceptance'
+  if(-not $journal -or @($journal.PSObject.Properties).Count -ne 2 -or $journal.FromHash -isnot [string] -or $journal.ToHash -isnot [string] -or
+    $journal.FromHash -cnotmatch '^[A-Fa-f0-9]{64}$' -or $journal.ToHash -cnotmatch '^[A-Fa-f0-9]{64}$' -or
+    $journal.FromHash -ceq $journal.ToHash -or $State.PrivateHashes.'compose.json' -cnotin @($journal.FromHash,$journal.ToHash) -or
+    ($State.Phase -ceq 'Accepted' -and $State.PrivateHashes.'compose.json' -cne $journal.ToHash)){
+    Stop-Prod 'Acceptance integrity journal is missing or inconsistent; retain state for recovery.'
+  }
+}
+function Get-AcceptedOverrideText([string]$Text) {
+  try {$configuration=ConvertFrom-Json $Text -ErrorAction Stop}catch{Stop-Prod 'Invalid recorded Compose override; cannot accept.'}
+  $names=@('open-webui','knowledge-service','document-planner-prod')
+  if($configuration -isnot [pscustomobject] -or $configuration.services -isnot [pscustomobject] -or
+    @(Compare-Object @($configuration.services.PSObject.Properties.Name) $names -CaseSensitive).Count){Stop-Prod 'Acceptance requires precisely the three recorded Compose services.'}
+  foreach($name in $names){
+    $service=$configuration.services.$name
+    if($service -isnot [pscustomobject] -or ($service.PSObject.Properties['restart'] -and $service.restart -cne 'no')){Stop-Prod 'Original Compose restart policy differs from the pre-acceptance configuration.'}
+    if($service.PSObject.Properties['restart']){$service.restart='unless-stopped'}
+    else{$service | Add-Member -NotePropertyName restart -NotePropertyValue 'unless-stopped'}
+  }
+  ConvertTo-Json -InputObject $configuration -Depth 40
+}
+function Write-AcceptanceArtifact([string]$Path,[string]$Text) {
+  if(Test-Path -LiteralPath $Path){
+    Protect-ProdPath $Path
+    if((Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash -ine (Get-TextHash $Text)){Stop-Prod 'An acceptance artifact is occupied or changed; never overwrite unknown recovery data.'}
+  }else{Write-PrivateText $Path $Text}
+}
+function Assert-AcceptanceConfiguration($State) {
+  Assert-AcceptanceJournal $State
+  $before=Join-Path $State.Directory 'compose.before-accept.json';$after=Join-Path $State.Directory 'compose.accepted.json'
+  foreach($pair in @(@($before,$State.Acceptance.FromHash),@($after,$State.Acceptance.ToHash))){
+    Protect-ProdPath $pair[0]
+    if((Get-FileHash -LiteralPath $pair[0] -Algorithm SHA256).Hash -ine $pair[1]){Stop-Prod 'Recorded acceptance configuration artifact changed; do not resume.'}
+  }
+  $desired=Get-AcceptedOverrideText ([IO.File]::ReadAllText($before,[Text.UTF8Encoding]::new($false,$true)))
+  if((Get-TextHash $desired) -ine $State.Acceptance.ToHash){Stop-Prod 'Acceptance configuration changes more than the three restart policies.'}
+}
+function Assert-AcceptanceReady($State) {
+  $names=@('open-webui','knowledge-service','document-planner-prod')
+  foreach($inventory in @($State.Replacements,$State.ReplacementFingerprints)){
+    if(@(Compare-Object @($inventory.PSObject.Properties.Name) $names -CaseSensitive).Count){Stop-Prod 'Acceptance requires a complete recorded replacement identity/configuration inventory.'}
+  }
+  Assert-Release $State
+  if($State.Phase -cin @('Accepting','Accepted')){Assert-AcceptanceConfiguration $State}
+  $null=Assert-Storage $State;Assert-NoUnknownWriters $State
+  Assert-ProductionNetworks $State -ReadOnly
+  foreach($name in $names){
+    Assert-Id $State.Replacements.$name
+    if(-not $State.ReplacementFingerprints.$name){Stop-Prod 'Acceptance requires recorded replacement fingerprints.'}
+    $null=Get-Replacement $State $name
+  }
+  Assert-ProductionReady $State
 }
 function Export-ProdRelease($State,[string[]]$Tracked) {
   foreach($path in @('scripts/document_service_production.py','scripts/document_pipeline_v06c.py','scripts/knowledge_adapter_v04c.py',
@@ -990,7 +1052,7 @@ function Read-ProdState([string]$Path) {
   try{$state=ConvertFrom-Json ([IO.File]::ReadAllText($path,[Text.UTF8Encoding]::new($false,$true))) -ErrorAction Stop}catch{Stop-Prod 'Invalid private deployment state.'}
   if($state.Schema -ne 1 -or $state.Root -ine $root -or $state.Commit -cnotmatch '^[a-f0-9]{40}$' -or $state.RunId -cnotmatch '^\d{8}-\d{6}-[a-f0-9]{8}$' -or
     $state.Directory -ine [IO.Path]::GetDirectoryName($path) -or $state.StatePath -ine $path -or
-    $state.Phase -cnotin @('Preparing','Prepared','Quiescing','ColdBackupsVerified','Renaming','Starting','ReadyForOperatorAcceptance','RollbackStopping','RestoringData','RollbackStarting','RolledBack')){Stop-Prod 'Deployment state identity/phase is invalid.'}
+    $state.Phase -cnotin @('Preparing','Prepared','Quiescing','ColdBackupsVerified','Renaming','Starting','ReadyForOperatorAcceptance','Accepting','Accepted','RollbackStopping','RestoringData','RollbackStarting','RolledBack')){Stop-Prod 'Deployment state identity/phase is invalid.'}
   $expected=Join-Path (Join-Path $root 'runtime/production/private') $state.RunId
   if($state.Directory -ine $expected -or $state.DatabasePath -ine (Join-Path $root 'knowledge-db') -or
     $state.Template -ine (Join-Path $expected 'compose.yml') -or $state.Override -ine (Join-Path $expected 'compose.json')){Stop-Prod 'Private state paths are not approved.'}
@@ -998,6 +1060,7 @@ function Read-ProdState([string]$Path) {
   if(@(Compare-Object @($state.Originals.PSObject.Properties.Name) $names -CaseSensitive).Count){Stop-Prod 'Original recovery inventory is incomplete.'}
   foreach($name in $names){Assert-Id $state.Originals.$name.Id;$null=Get-RestartArgument $state.Originals.$name.RestartPolicy
     if($state.Originals.$name.BackupName -cne "$name-prod-backup-$($state.RunId)"){Stop-Prod 'Unexpected original backup name.'}}
+  if($state.Phase -cin @('Accepting','Accepted')){Assert-AcceptanceJournal $state}
   $state
 }
 function Invoke-ProdPrepare([string]$Commit) {
@@ -1090,7 +1153,8 @@ function Invoke-ProdPrepare([string]$Commit) {
   [pscustomobject]@{Action='Prepare';Phase=$state.Phase;StatePath=$state.StatePath;Commit=$Commit}
 }
 
-function Assert-ProductionNetworks($State,[switch]$Create) {
+function Assert-ProductionNetworks($State,[switch]$Create,[switch]$ReadOnly) {
+  if($ReadOnly -and ($Create -or -not $State.EgressId)){Stop-Prod 'Acceptance requires recorded existing production networks; creation is forbidden.'}
   $internal=Read-DockerJson @('network','inspect','--format','{{json .}}','agent-internal')
   if($internal.Id -cne $State.InternalNetwork){Stop-Prod 'The external internal network was replaced.'}
   $found=Invoke-ProdNative Docker @('network','ls','-q','--no-trunc','--filter','name=^agent-production-egress$') 'egress identity check'
@@ -1103,7 +1167,7 @@ function Assert-ProductionNetworks($State,[switch]$Create) {
   if($network.Name -cne 'agent-production-egress' -or $network.Driver -cne 'bridge' -or $network.Internal -or
     (Get-Field $network.Labels 'io.agent-production.project') -cne 'agent-production' -or
     ($State.EgressId -and $network.Id -cne $State.EgressId)){Stop-Prod 'Unexpected production egress identity/configuration.'}
-  $State.EgressId=$network.Id;Save-ProdState $State
+  if(-not $ReadOnly){$State.EgressId=$network.Id;Save-ProdState $State}
 }
 function Invoke-ProdCutover($State) {
   if($State.Phase -cne 'Prepared'){Stop-Prod 'Cutover requires Prepared state. For a partial failure use the recorded Rollback, not blind retries.'}
@@ -1138,6 +1202,49 @@ function Invoke-ProdCutover($State) {
   if(-not $ready){Stop-Prod 'Readiness failed; use Status and explicit Rollback.'}
   Set-ProdPhase $State 'ReadyForOperatorAcceptance'
   [pscustomobject]@{Action='Cutover';Phase=$State.Phase;StatePath=$State.StatePath;ManualAcceptanceRequired=$true}
+}
+function Invoke-ProdAccept($State) {
+  if($State.Phase -cnotin @('ReadyForOperatorAcceptance','Accepting','Accepted')){Stop-Prod 'Accept requires ReadyForOperatorAcceptance, Accepting or Accepted state; never rerun Cutover.'}
+  Assert-AcceptanceReady $State
+  if($State.Phase -ceq 'Accepted'){return [pscustomobject]@{Action='Accept';Phase=$State.Phase;StatePath=$State.StatePath;Commit=$State.Commit}}
+  if($State.Phase -ceq 'ReadyForOperatorAcceptance'){
+    $before=[IO.File]::ReadAllText($State.Override,[Text.UTF8Encoding]::new($false,$true))
+    $after=Get-AcceptedOverrideText $before
+    Write-AcceptanceArtifact (Join-Path $State.Directory 'compose.before-accept.json') $before
+    Write-AcceptanceArtifact (Join-Path $State.Directory 'compose.accepted.json') $after
+    $State | Add-Member -NotePropertyName Acceptance -NotePropertyValue ([pscustomobject]@{
+      FromHash=$State.PrivateHashes.'compose.json';ToHash=(Get-TextHash $after).ToUpperInvariant()}) -Force
+    Set-ProdPhase $State 'Accepting' # Write-ahead record precedes config/live changes.
+  }
+  Assert-AcceptanceReady $State
+  $actual=(Get-FileHash -LiteralPath $State.Override -Algorithm SHA256).Hash
+  if($actual -ceq $State.Acceptance.FromHash){
+    $pending=Join-Path $State.Directory 'compose.accepting.new'
+    Write-AcceptanceArtifact $pending ([IO.File]::ReadAllText((Join-Path $State.Directory 'compose.accepted.json'),[Text.UTF8Encoding]::new($false,$true)))
+    Assert-AcceptanceReady $State
+    Assert-NoReparse $pending;Assert-NoReparse $State.Override
+    [IO.File]::Replace($pending,$State.Override,[NullString]::Value)
+    Protect-ProdPath $State.Override
+  }
+  if((Get-FileHash -LiteralPath $State.Override -Algorithm SHA256).Hash -cne $State.Acceptance.ToHash){Stop-Prod 'Accepted Compose configuration failed readback; retain the Accepting state.'}
+  $State.PrivateHashes.'compose.json'=$State.Acceptance.ToHash;Save-ProdState $State
+  foreach($name in @('open-webui','knowledge-service','document-planner-prod')){
+    Assert-AcceptanceReady $State
+    $current=Get-Replacement $State $name
+    if((Get-RestartArgument $current.Record.RestartPolicy) -ceq 'no'){
+      $null=Invoke-ProdNative Docker @('container','update','--restart=unless-stopped',$current.Record.Id) 'verified production acceptance restart policy update'
+    }
+    $check=Get-Replacement $State $name
+    if((Get-RestartArgument $check.Record.RestartPolicy) -cne 'unless-stopped'){Stop-Prod "Acceptance restart policy readback failed for $name; resume only with recorded identities."}
+  }
+  Assert-AcceptanceReady $State
+  foreach($name in @('open-webui','knowledge-service','document-planner-prod')){
+    $current=Get-Replacement $State $name
+    if((Get-RestartArgument $current.Record.RestartPolicy) -cne 'unless-stopped'){Stop-Prod 'Acceptance requires all three live policy readbacks before completion.'}
+  }
+  $State | Add-Member -NotePropertyName AcceptedAtUtc -NotePropertyValue ([DateTime]::UtcNow.ToString('o')) -Force
+  Set-ProdPhase $State 'Accepted'
+  [pscustomobject]@{Action='Accept';Phase=$State.Phase;StatePath=$State.StatePath;Commit=$State.Commit}
 }
 function Stop-ProdReplacements($State) {
   Register-Replacements $State
@@ -1209,13 +1316,14 @@ function Invoke-ProdRollback($State,[switch]$RestoreData) {
   [pscustomobject]@{Action='Rollback';Phase=$State.Phase;StatePath=$State.StatePath;DataRestored=[bool]$RestoreData}
 }
 function Invoke-ProdDeployment {
-  param([ValidateSet('Prepare','Cutover','Status','Rollback')][string]$Action,[string]$ExpectedCommit,[string]$StatePath,[switch]$RestoreData)
+  param([ValidateSet('Prepare','Cutover','Accept','Status','Rollback')][string]$Action,[string]$ExpectedCommit,[string]$StatePath,[switch]$RestoreData)
   try{
     if($Action -eq 'Prepare'){if($RestoreData -or $StatePath){Stop-Prod 'Prepare accepts only the explicit expected commit.'};return Invoke-ProdPrepare $ExpectedCommit}
     if(-not $StatePath){Stop-Prod 'Supply the exact private StatePath printed by Prepare.'}
     $state=Read-ProdState $StatePath
     switch($Action){
       'Cutover' {if($RestoreData){Stop-Prod 'RestoreData is only valid for Rollback.'};Invoke-ProdCutover $state}
+      'Accept' {if($RestoreData -or $ExpectedCommit){Stop-Prod 'Accept uses only the recorded StatePath; RestoreData/ExpectedCommit are not accepted.'};Invoke-ProdAccept $state}
       'Rollback' {Invoke-ProdRollback $state -RestoreData:$RestoreData}
       'Status' {
         foreach($name in $state.Originals.PSObject.Properties.Name){$null=Assert-Original $state $name}

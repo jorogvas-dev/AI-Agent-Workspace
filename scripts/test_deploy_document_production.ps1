@@ -468,6 +468,70 @@ $script:orchestration=@{
   }
 }
 
+function New-TestAcceptanceState {
+  $state=New-TestState
+  With-Mocks $script:orchestration {$null=Invoke-ProdCutover $state}
+  # Keep synthetic release paths below Windows PowerShell 5.1's MAX_PATH ceiling.
+  $state.Root=Join-Path ([IO.Path]::GetTempPath()) ('pa-'+[guid]::NewGuid().ToString('N').Substring(0,8))
+  $state.Directory=Join-Path (Join-Path $state.Root 'runtime/production/private') $state.RunId
+  $state.StatePath=Join-Path $state.Directory 'state.json';$state.DatabasePath=Join-Path $state.Root 'knowledge-db'
+  $state.Release=Join-Path (Join-Path (Join-Path $state.Root 'runtime/production/releases') $state.Commit) $state.RunId
+  $state.EgressId='e'*64
+  $null=[IO.Directory]::CreateDirectory($state.Directory);$null=[IO.Directory]::CreateDirectory($state.Release)
+  [IO.File]::WriteAllText((Join-Path $state.Release 'synthetic-runtime.txt'),'synthetic release only',[Text.UTF8Encoding]::new($false))
+  $state.ReleaseHash=Get-ReleaseHash $state.Release
+  $state | Add-Member -NotePropertyName Override -NotePropertyValue (Join-Path $state.Directory 'compose.json')
+  $state | Add-Member -NotePropertyName Template -NotePropertyValue (Join-Path $state.Directory 'compose.yml')
+  $services=[ordered]@{}
+  foreach($name in @('open-webui','knowledge-service','document-planner-prod')){
+    $services[$name]=[ordered]@{labels=@{'io.agent-production.run'=$state.RunId;'io.agent-production.commit'=$state.Commit}}
+    $state.ExpectedMounts | Add-Member -NotePropertyName $name -NotePropertyValue @()
+  }
+  $services['open-webui'].restart='no';$services['open-webui'].ports=@(@{target=8080;published='3000';host_ip='127.0.0.1'})
+  [IO.File]::WriteAllText($state.Override,(ConvertTo-Json @{services=$services;volumes=@{'open-webui'=@{external=$true;name='open-webui'}}} -Depth 30),[Text.UTF8Encoding]::new($false))
+  $hashes=[ordered]@{}
+  foreach($file in @('webui.env','knowledge.env','agent_knowledge_token','document_planner_prod_token','compose.json','compose.yml','empty.env')){
+    $path=Join-Path $state.Directory $file
+    if($file -cne 'compose.json'){[IO.File]::WriteAllText($path,'synthetic-only',[Text.UTF8Encoding]::new($false))}
+    $hashes[$file]=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+  }
+  $state | Add-Member -NotePropertyName PrivateHashes -NotePropertyValue ([pscustomobject]$hashes)
+  $ui=$script:containers[$state.Replacements.'open-webui']
+  $ui.Raw.HostConfig.PortBindings=[pscustomobject]@{'8080/tcp'=@([pscustomobject]@{HostIp='127.0.0.1';HostPort='3000'})}
+  $state | Add-Member -NotePropertyName UiPorts -NotePropertyValue @(Get-ProdPorts $ui)
+  $state | Add-Member -NotePropertyName UiEnvHash -NotePropertyValue (Get-EnvHash @())
+  $state | Add-Member -NotePropertyName KnowledgeEnvHash -NotePropertyValue (Get-EnvHash @())
+  $script:acceptanceState=$state;$script:acceptanceFailure='';$script:acceptanceFailureAfterUpdate=$false;$script:acceptanceIgnoreUpdate=$false;$script:acceptanceReadinessFailure=$false
+  With-Mocks @{'Protect-ProdPath'={param($Path)}} {Save-ProdState $state}
+  $script:events.Clear();$state
+}
+$script:acceptanceMocks=@{}
+foreach($key in $script:orchestration.Keys){$script:acceptanceMocks[$key]=$script:orchestration[$key]}
+$script:acceptanceMocks.Remove('Assert-Release');$script:acceptanceMocks.Remove('Save-ProdState')
+$script:acceptanceMocks['Protect-ProdPath']={param($Path)}
+$script:acceptanceMocks['Get-ProdRoot']={$script:acceptanceState.Root}
+$script:acceptanceMocks['Assert-Storage']={param($State) $script:events.Add('storage-verified')}
+$script:acceptanceMocks['Assert-ProductionNetworks']={param($State,[switch]$Create,[switch]$ReadOnly)
+  Assert-Test ($ReadOnly -and -not $Create) 'acceptance only inspects recorded networks';$script:events.Add('networks-verified')
+}
+$script:acceptanceMocks['Assert-ProductionReady']={param($State)
+  Assert-BackupsDormant $State;Assert-ReplacementConfiguration $State
+  $script:events.Add('ready');if($script:acceptanceReadinessFailure){Stop-Prod 'Synthetic readiness failure.'}
+}
+$script:acceptanceMocks['Invoke-ProdCompose']={throw 'TEST: acceptance must never run Compose or recreate containers'}
+$script:acceptanceMocks['Invoke-ProdNative']={param($Kind,$Arguments,$Operation,$InputText)
+  $acceptUpdate=$script:acceptanceState.Phase -ceq 'Accepting' -and $Kind -ceq 'Docker' -and $Arguments[1] -ceq 'update' -and $Arguments[2] -ceq '--restart=unless-stopped'
+  if($acceptUpdate){
+    Assert-Test ($Arguments.Count -eq 4 -and $Arguments[3] -cin @($script:acceptanceState.Replacements.PSObject.Properties.Value)) 'updates target precisely recorded replacement IDs'
+    Assert-Test ($script:events -contains 'ready') 'readiness precedes policy mutations'
+    if($script:acceptanceFailure -ceq $Arguments[3] -and -not $script:acceptanceFailureAfterUpdate){Stop-Prod 'Synthetic interrupted policy update.'}
+    if($script:acceptanceIgnoreUpdate){return ''}
+  }
+  $result=& ($script:orchestration['Invoke-ProdNative']) $Kind $Arguments $Operation $InputText
+  if($acceptUpdate -and $script:acceptanceFailure -ceq $Arguments[3] -and $script:acceptanceFailureAfterUpdate){Stop-Prod 'Synthetic interrupted policy update.'}
+  $result
+}
+
 Test-Case 'import is inert and PowerShell 5.1 syntax parses' {Assert-Test ($PSVersionTable.PSVersion.Major -eq 5) 'Windows PowerShell 5.1 validation';Assert-Test ($parseErrors.Count -eq 0) 'syntax valid'}
 Test-Case 'central helper Python bootstrap preserves every sandbox argument mount and cached-image guard' {
   $mounts=@('type=volume,source=open-webui,target=/source,readonly',"type=bind,source=$scratch,target=/out")
@@ -1051,6 +1115,153 @@ Test-Case 'wrong mounts reset data and a non-production API profile all fail rea
       'Get-KnowledgeBaseline'={param($Id,[switch]$Planner) [pscustomobject]@{chunks=5;files=2;documents=2;identities='baseline'}}
       'Invoke-ContainerProbe'={param($Id,$Code) [pscustomobject]@{profile='test';pipeline='0.6g';auth=$false}}
     } {$null=Expect-Failure {& $realReady $s} 'authentication/profile'}
+  }
+}
+
+Test-Case 'acceptance persists only three restart policies and is idempotent after live/config readback' {
+  $s=New-TestAcceptanceState;$original=ConvertFrom-Json ([IO.File]::ReadAllText($s.Override));$oldHashes=ConvertFrom-Json (ConvertTo-Json $s.PrivateHashes)
+  With-Mocks $script:acceptanceMocks {
+    $result=Invoke-ProdAccept $s
+    Assert-Test ($result.Phase -ceq 'Accepted' -and $s.AcceptedAtUtc) 'accepted recorded only after readbacks'
+    $after=ConvertFrom-Json ([IO.File]::ReadAllText($s.Override))
+    foreach($name in @('open-webui','knowledge-service','document-planner-prod')){
+      Assert-Test ($after.services.$name.restart -ceq 'unless-stopped') 'persisted Compose override controls future restarts'
+      Assert-Test ((Get-RestartArgument $script:containers[$s.Replacements.$name].Record.RestartPolicy) -ceq 'unless-stopped') 'live policy exactly unless-stopped with zero retry count'
+      if($original.services.$name.PSObject.Properties['restart']){$after.services.$name.restart=$original.services.$name.restart}else{$after.services.$name.PSObject.Properties.Remove('restart')}
+    }
+    Assert-Test ((Get-ObjectHash $after) -ceq (Get-ObjectHash $original)) 'all other Compose settings preserved'
+    foreach($file in $oldHashes.PSObject.Properties.Name){
+      if($file -ceq 'compose.json'){Assert-Test ($s.PrivateHashes.$file -ceq (Get-FileHash -LiteralPath $s.Override -Algorithm SHA256).Hash) 'integrity hash follows persisted policy configuration'}
+      else{Assert-Test ($s.PrivateHashes.$file -ceq $oldHashes.$file) 'other private hashes unchanged'}
+    }
+    Assert-BackupsDormant $s
+    $updates=@($script:events | Where-Object {$_ -like 'update:*'})
+    Assert-Test ($updates.Count -eq 3 -and @($updates | Where-Object {$_ -notin @($s.Replacements.PSObject.Properties.Value | ForEach-Object {'update:'+$_})}).Count -eq 0) 'exactly three recorded replacements updated; no originals touched'
+    $count=$updates.Count;$stateHash=(Get-FileHash -LiteralPath $s.StatePath -Algorithm SHA256).Hash;$time=$s.AcceptedAtUtc
+    $null=Invoke-ProdAccept $s
+    Assert-Test (@($script:events | Where-Object {$_ -like 'update:*'}).Count -eq $count -and $s.AcceptedAtUtc -ceq $time -and
+      (Get-FileHash -LiteralPath $s.StatePath -Algorithm SHA256).Hash -ceq $stateHash) 'repeated acceptance is read-only and preserves acceptance time'
+    Assert-Test (@($script:events | Where-Object {$_ -match 'start:|stop:|rm:|rename:|compose-up'}).Count -eq 0) 'acceptance never recreates, starts or stops containers'
+  }
+}
+Test-Case 'Accept dispatch reads the existing schema-1 ReadyForOperatorAcceptance state without migration or Git' {
+  $s=New-TestAcceptanceState
+  With-Mocks $script:acceptanceMocks {
+    $legacy=Read-ProdState $s.StatePath
+    Assert-Test ($legacy.Schema -eq 1 -and -not $legacy.PSObject.Properties['Acceptance']) 'existing deployed state shape remains supported'
+    $result=Invoke-ProdDeployment -Action Accept -StatePath $s.StatePath
+    $loaded=Read-ProdState $s.StatePath
+    Assert-Test ($result.Phase -ceq 'Accepted' -and $loaded.Phase -ceq 'Accepted' -and $loaded.Commit -ceq $s.Commit -and $loaded.ReleaseHash -ceq $s.ReleaseHash) 'same pinned release accepted with no new deployment'
+  }
+}
+Test-Case 'partial policy failures before or after Docker mutation resume safely using recorded identities' {
+  foreach($afterUpdate in @($false,$true)){
+    $s=New-TestAcceptanceState;$script:acceptanceFailure=$s.Replacements.'knowledge-service';$script:acceptanceFailureAfterUpdate=$afterUpdate
+    With-Mocks $script:acceptanceMocks {
+      $null=Expect-Failure {Invoke-ProdAccept $s} 'interrupted policy update'
+      $loaded=Read-ProdState $s.StatePath
+      Assert-Test ($loaded.Phase -ceq 'Accepting') 'interruption never records Accepted'
+      $script:acceptanceFailure='';$script:acceptanceState=$loaded
+      $planner=$script:containers[$loaded.Replacements.'document-planner-prod'];$fingerprint=$planner.Record.Fingerprint
+      $count=@($script:events | Where-Object {$_ -like 'update:*'}).Count;$planner.Record.Fingerprint='changed during interruption'
+      $null=Expect-Failure {Invoke-ProdAccept $loaded} 'replacement configuration changed'
+      Assert-Test (@($script:events | Where-Object {$_ -like 'update:*'}).Count -eq $count) 'resume rechecks every identity before updating any remaining policy'
+      $planner.Record.Fingerprint=$fingerprint
+      $null=Invoke-ProdAccept $loaded
+      Assert-Test ($loaded.Phase -ceq 'Accepted') 'mixed no/unless-stopped policies resume after revalidation'
+      Assert-Test (@($script:events | Where-Object {$_ -like 'update:*'}).Count -eq 3) 'already updated IDs are never updated twice'
+    }
+  }
+}
+Test-Case 'acceptance resumes across write-ahead config commit and integrity-hash checkpoint interruptions' {
+  $realSave=(Get-Command Save-ProdState).ScriptBlock;$realArtifact=(Get-Command Write-AcceptanceArtifact).ScriptBlock
+  foreach($point in @('before-config','after-config')){
+    $s=New-TestAcceptanceState;$script:acceptanceCrashPoint=$point
+    With-Mocks $script:acceptanceMocks {
+      With-Mocks @{
+        'Write-AcceptanceArtifact'={param($Path,$Text)
+          if($script:acceptanceCrashPoint -ceq 'before-config' -and $Path.EndsWith('compose.accepting.new')){Stop-Prod 'Synthetic config interruption.'}
+          & $realArtifact $Path $Text
+        }
+        'Save-ProdState'={param($State)
+          if($script:acceptanceCrashPoint -ceq 'after-config' -and $State.Phase -ceq 'Accepting' -and $State.PrivateHashes.'compose.json' -ceq $State.Acceptance.ToHash){Stop-Prod 'Synthetic config interruption.'}
+          & $realSave $State
+        }
+      } {$null=Expect-Failure {Invoke-ProdAccept $s} 'config interruption'}
+      $loaded=Read-ProdState $s.StatePath
+      Assert-Test ($loaded.Phase -ceq 'Accepting' -and $loaded.PrivateHashes.'compose.json' -ceq $loaded.Acceptance.FromHash) 'durable write-ahead state retains the original acknowledged hash'
+      $actual=(Get-FileHash -LiteralPath $s.Override -Algorithm SHA256).Hash
+      Assert-Test ($actual -ceq $(if($point -ceq 'before-config'){$loaded.Acceptance.FromHash}else{$loaded.Acceptance.ToHash})) 'actual config may be precisely the recorded old or new version'
+      $script:acceptanceState=$loaded;$null=Invoke-ProdAccept $loaded
+      Assert-Test ($loaded.Phase -ceq 'Accepted' -and $loaded.PrivateHashes.'compose.json' -ceq $loaded.Acceptance.ToHash) 'resume reconciles only the journaled config and integrity hash'
+    }
+  }
+}
+Test-Case 'identity configuration readiness and backup mismatches abort acceptance before mutations' {
+  foreach($fault in @('identity','fingerprint','project','inventory','readiness','backup','unexpected-policy')){
+    $s=New-TestAcceptanceState;$id=$s.Replacements.'open-webui';$oldHash=(Get-FileHash -LiteralPath $s.Override -Algorithm SHA256).Hash
+    switch($fault){
+      'identity'{$s.Replacements.'open-webui'='f'*64}
+      'fingerprint'{$script:containers[$id].Record.Fingerprint='changed'}
+      'project'{$script:containers[$id].Raw.Config.Labels.'com.docker.compose.project'='unknown'}
+      'inventory'{$s.ReplacementFingerprints.PSObject.Properties.Remove('knowledge-service')}
+      'readiness'{$script:acceptanceReadinessFailure=$true}
+      'backup'{$script:containers[$s.Originals.'open-webui'.Id].Raw.State.Running=$true}
+      'unexpected-policy'{$script:containers[$id].Record.RestartPolicy=[pscustomobject]@{Name='always';MaximumRetryCount=0}}
+    }
+    With-Mocks $script:acceptanceMocks {
+      $null=Expect-Failure {Invoke-ProdAccept $s} 'identity|configuration|Unknown owner|inventory|readiness|must remain stopped|policy mismatch'
+      Assert-Test ($s.Phase -ceq 'ReadyForOperatorAcceptance' -and -not (Test-Path -LiteralPath (Join-Path $s.Directory 'compose.accepted.json')) -and
+        (Get-FileHash -LiteralPath $s.Override -Algorithm SHA256).Hash -ceq $oldHash -and
+        @($script:events | Where-Object {$_ -like 'update:*'}).Count -eq 0) 'failed gates leave config, phase and live policies unchanged'
+    }
+  }
+}
+Test-Case 'failed live readback and changed pending configuration never record acceptance' {
+  $s=New-TestAcceptanceState;$script:acceptanceIgnoreUpdate=$true
+  With-Mocks $script:acceptanceMocks {
+    $null=Expect-Failure {Invoke-ProdAccept $s} 'policy readback failed'
+    Assert-Test ((Read-ProdState $s.StatePath).Phase -ceq 'Accepting') 'successful command without policy readback is insufficient'
+    $script:acceptanceIgnoreUpdate=$false
+    [IO.File]::AppendAllText($s.Override,'synthetic tamper')
+    $null=Expect-Failure {Invoke-ProdAccept $s} 'private configuration changed'
+    Assert-Test (@($script:events | Where-Object {$_ -like 'update:*'}).Count -eq 0) 'pending acceptance refuses a third configuration hash'
+  }
+}
+Test-Case 'phase-dependent readiness permits only expected policies and rollback restores originals after acceptance' {
+  foreach($phase in @('Accepting','Accepted')){
+    $s=New-TestAcceptanceState
+    With-Mocks $script:acceptanceMocks {
+      if($phase -ceq 'Accepted'){$null=Invoke-ProdAccept $s}else{
+        $script:acceptanceFailure=$s.Replacements.'knowledge-service'
+        $null=Expect-Failure {Invoke-ProdAccept $s} 'interrupted policy update';$script:acceptanceFailure=''
+      }
+      Assert-ReplacementConfiguration $s
+      if($phase -ceq 'Accepted'){
+        $entry=$script:containers[$s.Replacements.'open-webui'];$entry.Record.RestartPolicy=[pscustomobject]@{Name='no';MaximumRetryCount=0}
+        $null=Expect-Failure {Assert-ReplacementConfiguration $s} 'restart policy mismatch'
+        $entry.Record.RestartPolicy=[pscustomobject]@{Name='unless-stopped';MaximumRetryCount=0}
+      }
+      $null=Invoke-ProdRollback $s
+      Assert-Test ($s.Phase -ceq 'RolledBack') 'rollback works after completed or interrupted acceptance'
+      Assert-Restored $s
+    }
+  }
+}
+Test-Case 'acceptance network prerequisite validation is read-only and rejects unrecorded networks' {
+  $s=New-TestAcceptanceState
+  With-Mocks @{
+    'Read-DockerJson'={param($Arguments)
+      if($Arguments[-1] -ceq 'agent-internal'){return [pscustomobject]@{Id=$s.InternalNetwork}}
+      [pscustomobject]@{Name='agent-production-egress';Id=$s.EgressId;Driver='bridge';Internal=$false;Labels=[pscustomobject]@{'io.agent-production.project'='agent-production'}}
+    }
+    'Invoke-ProdNative'={param($Kind,$Arguments,$Operation,$InputText)
+      Assert-Test (($Arguments -join ' ') -ceq 'network ls -q --no-trunc --filter name=^agent-production-egress$') 'network check never creates or mutates a network';$s.EgressId
+    }
+    'Save-ProdState'={throw 'TEST: network validation must not mutate state before readiness'}
+  } {
+    Assert-ProductionNetworks $s -ReadOnly
+    $s.EgressId=$null;$null=Expect-Failure {Assert-ProductionNetworks $s -ReadOnly} 'recorded existing production networks'
   }
 }
 
