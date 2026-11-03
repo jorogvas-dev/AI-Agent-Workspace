@@ -84,7 +84,14 @@ The observed production knowledge host/port/model/watcher settings must match;
 document binds must still be root `input/` and `knowledge/`. Cached helper `sh`,
 `tar`, `find`, `sha256sum`, `sort`, `cmp` and `rm` must work offline. Prepare and
 Cutover check all of them before quiescing; data rollback checks again before
-stopping writers. The conservative archive
+stopping writers. Every helper shell operation enters through the existing
+cached image's Python bootstrap. It reads stdin as bytes, converts CRLF and lone
+CR to LF, then passes those bytes to `['sh', '-s']`, retaining the `set -eu`
+prefix. This includes Windows PowerShell's appended terminal CRLF and multiline
+shell constructs; UTF-8 content is preserved. Shell stdout/stderr are inherited
+and its exit code is propagated without extra bootstrap output. No host shell
+interpolation, installation, image change or pull is involved; the existing helper sandbox and
+mount restrictions remain in force. The conservative archive
 policy supports regular files/directories, including dotfiles; **links, hardlinks,
 special entries, duplicate paths, and traversal names are refused**. If cache or
 data contains links, obtain a separately reviewed backup implementation; do not
@@ -230,6 +237,9 @@ real credentials, operate production/test containers, run application tests, or
 prove that the live prerequisites or acceptance cases pass. Synthetic scratch
 files are retained in the Windows temporary directory for inspection. Embedded
 import/catalog probes execute in a standard-library harness with HTTP, Chroma
-and `runpy` fakes and networking blocked. The default interpreter is the existing workspace
+and `runpy` fakes and networking blocked. The actual helper bootstrap is tested
+with subprocess execution mocked, covering newline bytes, UTF-8 shell text,
+exit codes, inherited output and unchanged sandbox arguments; no real shell runs.
+The default interpreter is the existing workspace
 `.venv/Scripts/python.exe`; pass `-PythonExecutable '<existing-python-path>'` to
 select another installed interpreter. No dependency installation is performed.

@@ -37,12 +37,30 @@ $null=New-Item -ItemType Directory -Path $scratch
 # No application modules, credential files, Docker, Git or network are accessed.
 $pythonHarness=Join-Path $scratch 'synthetic-probes.py'
 [IO.File]::WriteAllText($pythonHarness,@'
-import contextlib,hashlib,io,json,os,runpy,socket,sys,types,urllib.error,urllib.parse,urllib.request
+import base64,contextlib,hashlib,io,json,os,runpy,socket,subprocess,sys,types,urllib.error,urllib.parse,urllib.request
 from pathlib import Path
 from unittest.mock import patch
 case=json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
 os.environ.clear()
 os.environ.update(KNOWLEDGE_TOKEN='synthetic-offline-token',CHROMA_HOST='chromadb',CHROMA_PORT='8000')
+if case.get('mode')=='helper-bootstrap':
+    calls=[]; stdout=io.StringIO(); stderr=io.StringIO(); exit_code=None
+    def shell(args,**kwargs):
+        assert args==['sh','-s'] and set(kwargs)=={'input'}
+        assert type(kwargs['input']) is bytes
+        calls.append(dict(args=args,input_base64=base64.b64encode(kwargs['input']).decode()))
+        # Inherited streams must be preserved, with no bootstrap chatter.
+        print('synthetic shell stdout'); print('synthetic shell stderr',file=sys.stderr)
+        return types.SimpleNamespace(returncode=case['exit_code'])
+    stdin=types.SimpleNamespace(buffer=io.BytesIO(base64.b64decode(case['input_base64'])))
+    try:
+        with patch.object(subprocess,'run',shell), patch.object(sys,'stdin',stdin), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            try: exec(compile(case['code'],'<helper-bootstrap>','exec'),{})
+            except SystemExit as stop: exit_code=stop.code
+        assert len(calls)==1
+        result=dict(ok=True,exit_code=exit_code,calls=calls,stdout=stdout.getvalue(),stderr=stderr.getvalue())
+    except Exception as exc: result=dict(ok=False,error=type(exc).__name__)
+    print(json.dumps(result)); sys.exit(0)
 calls=[]; output=io.StringIO(); result=None; ok=False; error=None
 fault=case.get('fault'); size=case.get('size',53); mode=case.get('mode','catalog')
 docs=[]
@@ -134,16 +152,29 @@ try:
 except Exception as exc: error=type(exc).__name__
 print(json.dumps(dict(ok=ok,error=error,result=result,calls=calls)))
 '@,[Text.UTF8Encoding]::new($false))
-function Invoke-SyntheticProbe([string]$Code,[string]$Mode='catalog',[string]$Fault='',[int]$Size=53,[switch]$Planner) {
+function Invoke-SyntheticProbe([string]$Code,[string]$Mode='catalog',[string]$Fault='',[int]$Size=53,[switch]$Planner,
+  [byte[]]$InputBytes=@(),[int]$ExitCode=0) {
   if(-not (Test-Path -LiteralPath $PythonExecutable -PathType Leaf)){throw 'TEST: supply -PythonExecutable for the offline standard-library probe harness.'}
   $fixture=Join-Path $scratch ('probe-'+[guid]::NewGuid().ToString('N')+'.json')
-  [IO.File]::WriteAllText($fixture,(ConvertTo-Json @{code=$Code;mode=$Mode;fault=$Fault;size=$Size;planner=[bool]$Planner}),[Text.UTF8Encoding]::new($false))
+  [IO.File]::WriteAllText($fixture,(ConvertTo-Json @{code=$Code;mode=$Mode;fault=$Fault;size=$Size;planner=[bool]$Planner;
+    input_base64=[Convert]::ToBase64String($InputBytes);exit_code=$ExitCode}),[Text.UTF8Encoding]::new($false))
   $raw=@(& $PythonExecutable -I -B $pythonHarness $fixture 2>&1)
   if($LASTEXITCODE -ne 0){throw 'TEST: synthetic probe harness failed; native output withheld.'}
   ConvertFrom-Json ($raw -join "`n")
 }
 function Get-SyntheticBaselineCode([switch]$Planner) {
   With-Mocks @{'Invoke-ContainerProbe'={param($Id,$Code) $Code}} { Get-KnowledgeBaseline ('1'*64) -Planner:$Planner }
+}
+function Get-SyntheticHelperInvocation([string]$Code,[string[]]$Mounts=@()) {
+  With-Mocks @{
+    'Read-DockerJson'={param($Arguments)
+      Assert-Test (($Arguments -join ' ') -ceq ('image inspect --format {{json .Id}} '+(Get-ProdImages).helper)) 'helper image is verified by its unchanged cached ID'
+      (Get-ProdImages).helper
+    }
+    'Invoke-ProdNative'={param($Kind,$Arguments,$Operation,$InputText)
+      [pscustomobject]@{Kind=$Kind;Arguments=$Arguments;InputText=$InputText}
+    }
+  } { Invoke-Helper $null $Mounts $Code }
 }
 
 function New-TestState {
@@ -281,6 +312,51 @@ $script:orchestration=@{
 }
 
 Test-Case 'import is inert and PowerShell 5.1 syntax parses' {Assert-Test ($PSVersionTable.PSVersion.Major -eq 5) 'Windows PowerShell 5.1 validation';Assert-Test ($parseErrors.Count -eq 0) 'syntax valid'}
+Test-Case 'central helper Python bootstrap preserves every sandbox argument mount and cached-image guard' {
+  $mounts=@('type=volume,source=open-webui,target=/source,readonly',"type=bind,source=$scratch,target=/out")
+  $code="for tool in tar find; do`r`n  command -v `"`$tool`" >/dev/null`r`ndone"
+  $run=Get-SyntheticHelperInvocation $code $mounts;$bootstrap=$run.Arguments[-1]
+  $expected=@('run','--rm','-i','--pull','never','--network','none','--read-only','--user','0:0','--cap-drop','ALL',
+    '--cap-add','CHOWN','--cap-add','DAC_OVERRIDE','--cap-add','FOWNER','--cap-add','FSETID','--security-opt','no-new-privileges:true',
+    '--pids-limit','64','--tmpfs','/tmp:rw,size=16m','--entrypoint','python')
+  foreach($mount in $mounts){$expected+=@('--mount',$mount)}
+  $expected+=@((Get-ProdImages).helper,'-B','-c',$bootstrap)
+  Assert-Test ($run.Kind -ceq 'Docker' -and (Get-ObjectHash $run.Arguments) -ceq (Get-ObjectHash $expected)) 'only entrypoint/command changes; all sandbox flags and narrow mounts preserved'
+  Assert-Test ($run.InputText -ceq ("set -eu`n"+$code)) 'set -eu prefix and original shell text enter the central byte bootstrap'
+  $script:helperNativeCalled=$false
+  With-Mocks @{
+    'Read-DockerJson'={param($Arguments) 'sha256:'+('0'*64)}
+    'Invoke-ProdNative'={$script:helperNativeCalled=$true;throw 'TEST: must reject uncached image before running helper'}
+  } {
+    $null=Expect-Failure {Invoke-Helper $null @() $code} 'Cached backup helper is unavailable'
+    Assert-Test (-not $script:helperNativeCalled) 'no alternate image or pull on failed cache identity'
+  }
+}
+Test-Case 'bootstrap normalizes all byte newline forms preserves UTF-8 and shell constructs and propagates exit/streams' {
+  $unicode=([string][char]0x03A9)+' caf'+[char]0x00E9
+  $lines=@('set -eu',('for item in ''{0}'' ''literal $HOME''; do' -f $unicode),
+    '  if test -n "$item"; then','    printf ''%s\n'' "$item"','  fi','done')
+  $expected=$lines -join "`n";$code=($lines | Select-Object -Skip 1) -join "`n"
+  $run=Get-SyntheticHelperInvocation $code
+  Assert-Test ($run.Arguments[-2] -ceq '-c' -and $run.InputText -ceq $expected) 'execute actual centrally supplied Python source and set -eu payload'
+  $mixed=[Text.StringBuilder]::new();$endings=@("`r`n","`r","`n")
+  for($i=0;$i -lt $lines.Count;$i++){
+    $null=$mixed.Append($lines[$i]);if($i -lt $lines.Count-1){$null=$mixed.Append($endings[$i%3])}
+  }
+  $variants=@(@{Name='LF';Text=$expected;Expected=$expected},
+    @{Name='CRLF';Text=$expected.Replace("`n","`r`n");Expected=$expected},
+    @{Name='lone CR';Text=$expected.Replace("`n","`r");Expected=$expected},
+    @{Name='mixed';Text=$mixed.ToString();Expected=$expected},
+    @{Name='terminal CRLF';Text=$expected+"`r`n";Expected=$expected+"`n"})
+  foreach($variant in $variants){foreach($exitCode in @(0,2,7,125)){
+    $bytes=[Text.Encoding]::UTF8.GetBytes($variant.Text)
+    $check=Invoke-SyntheticProbe $run.Arguments[-1] -Mode helper-bootstrap -InputBytes $bytes -ExitCode $exitCode
+    Assert-Test ($check.ok -and $check.exit_code -eq $exitCode) "$($variant.Name) propagates shell exit $exitCode"
+    Assert-Test (($check.calls[0].args -join '|') -ceq 'sh|-s') 'shell receives an argument list, without a host shell'
+    Assert-Test ($check.calls[0].input_base64 -ceq [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($variant.Expected))) "$($variant.Name) preserves intended multiline UTF-8 bytes after normalization"
+    Assert-Test ($check.stdout -ceq "synthetic shell stdout`n" -and $check.stderr -ceq "synthetic shell stderr`n") 'streams inherited exactly; bootstrap adds no output'
+  }}
+}
 Test-Case 'raw UTF-8 env round-trip preserves quotes dollars hashes equals spaces and empty values' {
   $entries=@('WEBUI_SECRET_KEY=synthetic-$secret#=value','QUOTES="a" ''b''','DOLLARS=$HOME ${not-expanded}','HASH=#literal # value',
     'EQUALS=a=b=c','SPACES=  keep both  ','EMPTY=','UNICODE=Ω café')

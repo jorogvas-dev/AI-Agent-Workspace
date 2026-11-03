@@ -339,11 +339,18 @@ function Invoke-Helper($State, [string[]]$Mounts, [string]$Code) {
   if ($cached -cne $images.helper) { Stop-Prod 'Cached backup helper is unavailable; no pulls are permitted.' }
   # Tar must read all owners and restore original ownership/modes. These narrow
   # filesystem capabilities cannot make a read-only mount/root writable.
+  # PowerShell stdin can carry CRLF (including an appended final newline).
+  # Normalize bytes inside the cached image for EVERY helper shell operation.
+  $bootstrap=@'
+import subprocess,sys
+script=sys.stdin.buffer.read().replace(b'\r\n',b'\n').replace(b'\r',b'\n')
+sys.exit(subprocess.run(['sh','-s'],input=script).returncode)
+'@
   $args=@('run','--rm','-i','--pull','never','--network','none','--read-only','--user','0:0','--cap-drop','ALL',
     '--cap-add','CHOWN','--cap-add','DAC_OVERRIDE','--cap-add','FOWNER','--cap-add','FSETID','--security-opt','no-new-privileges:true',
-    '--pids-limit','64','--tmpfs','/tmp:rw,size=16m','--entrypoint','sh')
+    '--pids-limit','64','--tmpfs','/tmp:rw,size=16m','--entrypoint','python')
   foreach ($mount in $Mounts) { $args+=@('--mount',$mount) }
-  $args+=@($images.helper,'-s')
+  $args+=@($images.helper,'-B','-c',$bootstrap)
   Invoke-ProdNative Docker $args 'isolated cached backup helper' -InputText ("set -eu`n" + $Code)
 }
 function Assert-HelperCapabilities($State) {
