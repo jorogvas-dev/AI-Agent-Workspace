@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Authenticated, isolated knowledge-service adapter for planner v0.4c.
+"""Read-only knowledge adapters with explicit, fixed test/production profiles.
 
-The endpoint is intentionally fixed to the test Docker service. Production
-knowledge retrieval remains owned by the existing v0.3 workflow and is not
-reachable through this adapter.
+The existing adapter and isolated factory remain restricted to test endpoints.
+Production retrieval requires the separate production adapter/factory.
 """
 from __future__ import annotations
 
@@ -18,6 +17,8 @@ from typing import Any, Callable
 
 ISOLATED_ENDPOINT = "http://knowledge-service-test:8002/search"
 ISOLATED_DOCUMENTS_ENDPOINT = "http://knowledge-service-test:8002/documents"
+PRODUCTION_ENDPOINT = "http://knowledge-service:8002/search"
+PRODUCTION_DOCUMENTS_ENDPOINT = "http://knowledge-service:8002/documents"
 MAX_QUERY_LENGTH = 1000
 MAX_SCOPED_QUERY_BYTES = 4000
 MAX_LIMIT = 10
@@ -92,12 +93,16 @@ class KnowledgeServiceAdapter:
     ) -> None:
         if endpoint != ISOLATED_ENDPOINT:
             raise ValueError("Only the isolated knowledge-service endpoint is permitted")
+        self._initialize_transport(token_file, opener, timeout_seconds)
+        self._endpoint = ISOLATED_ENDPOINT
+        self._documents_endpoint = ISOLATED_DOCUMENTS_ENDPOINT
+
+    def _initialize_transport(self, token_file, opener, timeout_seconds) -> None:
         if not isinstance(token_file, Path):
             raise ValueError("token_file must be a Path")
         if not 1.0 <= timeout_seconds <= 30.0:
             raise ValueError("timeout_seconds must be between 1 and 30")
         self._token_file = token_file
-        self._endpoint = endpoint
         self._opener = opener or urllib.request.build_opener(_NoRedirect).open
         self._timeout = timeout_seconds
 
@@ -165,6 +170,11 @@ class KnowledgeServiceAdapter:
         max_response_bytes: int = MAX_RESPONSE_BYTES,
         ensure_ascii: bool = True,
     ) -> Any:
+        if not isinstance(url, str) or not (
+            (method == "POST" and url == self._endpoint)
+            or (method == "GET" and url.split("?", 1)[0] == self._documents_endpoint)
+        ):
+            raise KnowledgeAdapterError("Knowledge endpoint is not permitted")
         body = None if payload is None else json.dumps(
             payload, separators=(",", ":"), ensure_ascii=ensure_ascii, allow_nan=False
         ).encode("utf-8")
@@ -194,6 +204,10 @@ class KnowledgeServiceAdapter:
                     raise KnowledgeAdapterError("Knowledge service request failed")
                 raw = response.read(max_response_bytes + 1)
         except urllib.error.HTTPError as exc:
+            try:
+                exc.close()
+            except Exception:
+                pass
             if exc.code in {401, 403}:
                 raise KnowledgeAdapterError("Knowledge authentication failed") from None
             raise KnowledgeAdapterError("Knowledge service request failed") from None
@@ -217,7 +231,7 @@ class KnowledgeServiceAdapter:
         if type(limit) is not int or not 1 <= limit <= MAX_LIMIT:
             raise KnowledgeAdapterError("Knowledge result limit is invalid")
         payload = self._request(
-            "POST", ISOLATED_ENDPOINT,
+            "POST", self._endpoint,
             {"query": query, "limit": limit, "document": {"folder": folder, "source": source}},
             max_request_bytes=MAX_SCOPED_REQUEST_BYTES,
             ensure_ascii=False,
@@ -240,13 +254,13 @@ class KnowledgeServiceAdapter:
         return result
 
     def list_documents(self, limit: int = 50, offset: int = 0) -> dict[str, Any]:
-        """Read one bounded catalog page from the fixed isolated service."""
+        """Read one bounded catalog page from this adapter's fixed service."""
         if type(limit) is not int or not 1 <= limit <= MAX_DOCUMENT_PAGE:
             raise KnowledgeAdapterError("Knowledge catalog limit is invalid")
         if type(offset) is not int or not 0 <= offset <= MAX_DOCUMENT_OFFSET:
             raise KnowledgeAdapterError("Knowledge catalog offset is invalid")
         payload = self._request(
-            "GET", f"{ISOLATED_DOCUMENTS_ENDPOINT}?limit={limit}&offset={offset}",
+            "GET", f"{self._documents_endpoint}?limit={limit}&offset={offset}",
             max_response_bytes=MAX_CATALOG_RESPONSE_BYTES,
         )
         invalid = "Knowledge service returned an invalid document catalog"
@@ -294,3 +308,22 @@ class KnowledgeServiceAdapter:
 def create_isolated_adapter(token_file: Path, **kwargs: Any) -> KnowledgeServiceAdapter:
     """Create the only adapter exposed to v0.4c test mode."""
     return KnowledgeServiceAdapter(token_file, endpoint=ISOLATED_ENDPOINT, **kwargs)
+
+
+class ProductionKnowledgeServiceAdapter(KnowledgeServiceAdapter):
+    """Read-only production profile; test or arbitrary endpoints are rejected."""
+
+    def __init__(
+        self, token_file: Path, *, endpoint: str = PRODUCTION_ENDPOINT,
+        opener: Callable[..., Any] | None = None, timeout_seconds: float = 10.0,
+    ) -> None:
+        if endpoint != PRODUCTION_ENDPOINT:
+            raise ValueError("Only the production knowledge-service endpoint is permitted")
+        self._initialize_transport(token_file, opener, timeout_seconds)
+        self._endpoint = PRODUCTION_ENDPOINT
+        self._documents_endpoint = PRODUCTION_DOCUMENTS_ENDPOINT
+
+
+def create_production_adapter(token_file: Path, **kwargs: Any) -> ProductionKnowledgeServiceAdapter:
+    """Create the explicit production profile without endpoint selection/fallback."""
+    return ProductionKnowledgeServiceAdapter(token_file, endpoint=PRODUCTION_ENDPOINT, **kwargs)
