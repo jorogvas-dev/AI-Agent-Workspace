@@ -26,10 +26,10 @@ def field_request(name="visitor", value_type="text"):
     ]}
 
 
-def evidence_response(*, name="visitor", value="Mira", chunk_ref="c1", start_span=1, end_span=1):
+def evidence_response(*, name="visitor", value="Mira", chunk_ref="c1"):
     return {"task_type": "field_extraction", "fields": [{
-        "name": name, "status": "found", "candidates": [{
-            "value": value, "chunk_ref": chunk_ref, "start_span": start_span, "end_span": end_span,
+        "name": name, "candidates": [{
+            "value": value, "chunk_ref": chunk_ref,
         }],
     }]}
 
@@ -52,7 +52,43 @@ def requested_fields(count):
 
 
 def view_text(chunk_view):
-    return "".join(span["text"] for span in chunk_view["spans"])
+    return "".join(span[1] for span in chunk_view["spans"])
+
+
+def schema_accepts(schema, value):
+    """Interpret only the basic JSON Schema keywords used in provider tests."""
+    known = {"anyOf", "type", "const", "enum", "properties", "required", "additionalProperties",
+             "items", "minItems", "maxItems", "minLength", "maxLength", "pattern", "minimum", "maximum"}
+    if set(schema) - known:
+        raise AssertionError("Test schema interpreter needs an explicit keyword update")
+    if "anyOf" in schema:
+        if set(schema) != {"anyOf"}:
+            raise AssertionError("Provider alternatives must not have sibling constraints")
+        return any(schema_accepts(branch, value) for branch in schema["anyOf"])
+    if "const" in schema and value != schema["const"]:
+        return False
+    if "enum" in schema and value not in schema["enum"]:
+        return False
+    kind = schema.get("type")
+    if kind == "object":
+        if not isinstance(value, dict) or not set(schema.get("required", [])).issubset(value):
+            return False
+        properties = schema.get("properties", {})
+        if schema.get("additionalProperties") is False and set(value) - set(properties):
+            return False
+        return all(schema_accepts(properties[key], item) for key, item in value.items() if key in properties)
+    if kind == "array":
+        return (isinstance(value, list) and schema.get("minItems", 0) <= len(value)
+                <= schema.get("maxItems", float("inf"))
+                and all(schema_accepts(schema["items"], item) for item in value))
+    if kind == "string":
+        return (isinstance(value, str) and schema.get("minLength", 0) <= len(value)
+                <= schema.get("maxLength", float("inf"))
+                and ("pattern" not in schema or re.search(schema["pattern"], value) is not None))
+    if kind == "integer":
+        return (type(value) is int and schema.get("minimum", float("-inf")) <= value
+                <= schema.get("maximum", float("inf")))
+    return True
 
 
 class CatalogAdapter:
@@ -163,14 +199,14 @@ class DocumentPipelineV06cTests(unittest.TestCase):
         selected = document("transcripts/table-epsilon.txt", "knowledge")
         original = "Published rate\n16.00\t$\tper\thour\nEnd of table"
         adapter = CatalogAdapter([selected], [chunk(selected, original)])
-        response = evidence_response(name="published_rate", value="16.00", start_span=2, end_span=2)
+        response = evidence_response(name="published_rate", value="16.00")
         with patch.object(pipeline, "_evidence_spans", wraps=pipeline._evidence_spans) as build:
             result, _, client = self.run_request(
                 'Extract published_rate from "knowledge/transcripts/table-epsilon.txt".',
                 adapter=adapter, client=StructuredClient(field_request("published_rate", "numeric"), response),
             )
         self.assertTrue(result["success"], result)
-        self.assertEqual(result["fields"][0]["quote"], "16.00\t$\tper\thour\n")
+        self.assertEqual(result["fields"][0]["quote"], original)
         self.assertNotIn("$16.00", result["fields"][0]["quote"])
         self.assertEqual(result["fields"][0]["value"], "16.00")
         self.assertEqual(build.call_args.args[0][0]["text"], original)
@@ -178,7 +214,7 @@ class DocumentPipelineV06cTests(unittest.TestCase):
         self.assertEqual(adapter.chunks[0]["text"], original)
         provider = json.loads(client.calls[1]["messages"][1]["content"])
         self.assertEqual(provider["chunks"][0]["chunk_ref"], "c1")
-        self.assertEqual(provider["chunks"][0]["spans"][1], {"span": 2, "text": "16.00\t$\tper\thour\n"})
+        self.assertEqual(provider["chunks"][0]["spans"][1], [2, "16.00\t$\tper\thour\n"])
         self.assert_public_source_evidence(result, adapter.chunks)
 
     def test_unicode_tabs_and_lf_crlf_multiline_ranges_are_exact(self):
@@ -191,12 +227,12 @@ class DocumentPipelineV06cTests(unittest.TestCase):
                 planning = {"task_type": "field_extraction", "fields": [
                     {"name": "label", "value_type": "text"}, {"name": "mass", "value_type": "numeric"},
                 ]}
-                response = evidence_response(name="label", value="Café Ω", start_span=2, end_span=3)
-                response["fields"] += evidence_response(name="mass", value="45.50", start_span=3, end_span=3)["fields"]
+                response = evidence_response(name="label", value="Café Ω")
+                response["fields"] += evidence_response(name="mass", value="45.50")["fields"]
                 result, _, _ = self.run_request(adapter=adapter, client=StructuredClient(planning, response))
                 self.assertTrue(result["success"], result)
-                self.assertEqual(result["fields"][0]["quote"], title + measurement)
-                self.assertEqual(result["fields"][1]["quote"], measurement)
+                self.assertEqual(result["fields"][0]["quote"], original)
+                self.assertEqual(result["fields"][1]["quote"], title + measurement + "fin")
                 self.assertEqual(adapter.chunks[0]["text"], original)
                 self.assert_public_source_evidence(result, adapter.chunks)
 
@@ -209,7 +245,9 @@ class DocumentPipelineV06cTests(unittest.TestCase):
             {"start_span": 2, "end_span": 1}, {"end_span": 3}, {"end_span": 65},
             {"start_span": "c2:1"}, {"end_span": "c2:2"},
         ]
-        bad_selectors += [{key: "model-authored"} for key in ("quote", "source", "location", "chunk_id", "start_offset", "end_chunk_ref")]
+        bad_selectors += [{key: "model-authored"} for key in (
+            "quote", "source", "location", "chunk_id", "start_offset", "end_offset", "end_chunk_ref", "status",
+        )]
         for mutation in bad_selectors:
             with self.subTest(mutation=mutation):
                 adapter = CatalogAdapter(chunks=[chunk(document(), "Visitor: Mira.\nAlternate: Rin.")])
@@ -228,17 +266,20 @@ class DocumentPipelineV06cTests(unittest.TestCase):
         ]
         for mutation in (
             {"status": "missing"}, {"status": "ambiguous"}, {"status": []},
-            {"candidates": []}, {"candidates": ["not a candidate"]}, {"candidates": {}},
+            {"status": "found"}, {"candidates": ["not a candidate"]}, {"candidates": {}},
             {"quote": "authored"}, {"name": "unknown_field"},
         ):
             response = evidence_response()
             response["fields"][0].update(mutation)
             cases.append(response)
         response = evidence_response()
-        del response["fields"][0]["candidates"][0]["end_span"]
+        del response["fields"][0]["candidates"][0]["chunk_ref"]
         cases.append(response)
         response = evidence_response()
         response["fields"] *= 2
+        cases.append(response)
+        response = evidence_response()
+        response["fields"][0]["candidates"] *= engine.MAX_CANDIDATES + 1
         cases.append(response)
         for response in cases:
             result, _, client = self.run_request(client=StructuredClient(field_request(), response))
@@ -265,26 +306,178 @@ class DocumentPipelineV06cTests(unittest.TestCase):
         view, lookup = pipeline._evidence_spans(originals)
         self.assertEqual(len(view[0]["spans"]), 64)
         self.assertEqual(view_text(view[0]), original)
-        self.assertEqual([item["span"] for item in view[0]["spans"]], list(range(1, 65)))
+        self.assertEqual([item[0] for item in view[0]["spans"]], list(range(1, 65)))
         bounds = lookup["c1"]["bounds"]
         self.assertEqual(bounds[0][0], 0)
         self.assertEqual(bounds[-1][1], len(original))
         for index, (start, end) in enumerate(bounds):
-            self.assertEqual(original[start:end], view[0]["spans"][index]["text"])
-            self.assertTrue(view[0]["spans"][index]["text"].strip())
+            self.assertEqual(original[start:end], view[0]["spans"][index][1])
+            self.assertTrue(view[0]["spans"][index][1].strip())
             if index:
                 self.assertEqual(start, bounds[index - 1][1])
-        response = evidence_response(name="line_label", value="Liné 70", end_span=64)
+        response = evidence_response(name="line_label", value="Liné 70")
         result, _, client = self.run_request(adapter=CatalogAdapter(chunks=originals), client=StructuredClient(
             field_request("line_label", "text"), response,
         ))
         self.assertTrue(result["success"], result)
-        self.assertEqual(result["fields"][0]["quote"], original)
+        self.assertEqual(result["fields"][0]["quote"], original[bounds[33][0]:bounds[36][1]])
         self.assertEqual(client.calls[1]["schema_name"], "document_extract_v06g")
         self.assert_public_source_evidence(result, originals)
 
+    def test_every_agreeing_candidate_is_verified_before_deduplication(self):
+        originals = [ranked_chunk("support", "Measurement: 16.00 units"),
+                     ranked_chunk("wrong", "Measurement: 20.00 units"),
+                     ranked_chunk("oversized", "Measurement: 16.00 units " + "x" * engine.MAX_QUOTE_BYTES),
+                     ranked_chunk("engine-invalid", "9" * 129 + "\nMeasurement: 16.00 units")]
+        for bad, expected in (
+            ({"value": "16.00", "chunk_ref": "c99"}, "malformed_model_output"),
+            ({"value": "16.00", "chunk_ref": "c2"}, "invalid_evidence"),
+            ({"value": "16", "chunk_ref": "c1"}, "invalid_evidence"),
+            ({"value": "16.00", "chunk_ref": "c1", "start_span": 1}, "malformed_model_output"),
+            ({"value": "16.00", "chunk_ref": "c1", "status": "found"}, "malformed_model_output"),
+            ({"value": 16, "chunk_ref": "c1"}, "malformed_model_output"),
+            ({"value": "16.00", "chunk_ref": "c3"}, "malformed_model_output"),
+            ({"value": "16.00", "chunk_ref": "c4"}, "invalid_evidence"),
+        ):
+            for reverse in (False, True):
+                with self.subTest(bad=bad, reverse=reverse):
+                    response = evidence_response(name="measurement", value="16.00")
+                    response["fields"][0]["candidates"].append(bad)
+                    if reverse:
+                        response["fields"][0]["candidates"].reverse()
+                    result, _, client = self.run_request(adapter=CatalogAdapter(chunks=originals), client=StructuredClient(
+                        field_request("measurement", "numeric"), response,
+                    ))
+                    self.assertEqual(result["status"], expected)
+                    self.assertFalse(result["success"])
+                    self.assertEqual(result["model_calls"], 2)
+                    self.assertEqual(len(client.calls), 2)
+        response = evidence_response()
+        response["fields"][0]["candidates"].append({"value": "Mira", "chunk_ref": "c2"})
+        result, _, _ = self.run_request(adapter=CatalogAdapter(chunks=[ranked_chunk("a", "Visitor: Mira"),
+                                                                     ranked_chunk("b", "Visitor: Rin")]),
+                                        client=StructuredClient(field_request(), response))
+        self.assertEqual(result["status"], "invalid_evidence")
+
+    def test_agreeing_numeric_decimals_merge_with_an_actual_supporting_citation(self):
+        literals = ["16.00", "+16", "1.600e1", "16.0"]
+        originals = [ranked_chunk(f"support-{index}", f"Measurement: {literal} units")
+                     for index, literal in enumerate(literals)]
+        response = evidence_response(name="measurement", value=literals[0])
+        response["fields"][0]["candidates"] += [
+            {"value": literal, "chunk_ref": f"c{index}"} for index, literal in enumerate(literals[1:], start=2)
+        ]
+        for _ in range(2):
+            with patch.object(engine, "_validate_candidate", wraps=engine._validate_candidate) as validate:
+                result, _, _ = self.run_request(adapter=CatalogAdapter(chunks=originals), client=StructuredClient(
+                    field_request("measurement", "numeric"), response,
+                ))
+            self.assertGreaterEqual(validate.call_count, len(literals))
+            self.assertTrue(result["success"], result)
+            field = result["fields"][0]
+            self.assertEqual(field["status"], "found")
+            self.assertEqual(field["value"], "16.00")
+            self.assertEqual(field["chunk_id"], originals[0]["chunk_id"])
+            self.assertEqual(field["quote"], originals[0]["text"])
+            self.assert_public_source_evidence(result, originals)
+
+    def test_server_status_uses_distinct_verified_values_for_text_and_numeric_fields(self):
+        for value_type, first, second in (("numeric", "16.00", "17.00"), ("text", "Mira", "mira"),
+                                          ("text", "Mira", "Mira ")):
+            originals = [ranked_chunk("a", f"Label: {first}\nUnits."), ranked_chunk("b", f"Label: {second}\nUnits.")]
+            for values, expected in (([], "missing"), ([first], "found"), ([first, first], "found"),
+                                     ([first, second, first], "ambiguous")):
+                response = evidence_response(name="measurement", value=first)
+                response["fields"][0]["candidates"] = [
+                    {"value": value, "chunk_ref": "c2" if value == second else "c1"} for value in values
+                ]
+                result, _, _ = self.run_request(adapter=CatalogAdapter(chunks=originals), client=StructuredClient(
+                    field_request("measurement", value_type), response,
+                ))
+                field = result["fields"][0]
+                self.assertEqual(field["status"], expected)
+                self.assertEqual(result["status"], "success" if expected == "found" else expected)
+                self.assertEqual(result["success"], expected == "found")
+                self.assertTrue(result["valid"])
+                if expected == "ambiguous":
+                    self.assertEqual([item["value"] for item in field["candidates"]], [first, second])
+                self.assert_public_source_evidence(result, originals)
+
+    def test_quotes_cover_all_literal_matches_with_one_previous_and_two_following_spans(self):
+        for separator in ("\n", "\r\n"):
+            lines = ["Outside start", " \t", "Earlier context", "Published rate", "\t16.00\t$", "per", "hour",
+                     "middle context", "Repeated rate", "16.00\t$", "per", "hour", "Outside end"]
+            original = separator.join(lines)
+            expected = separator.join(lines[3:12]) + separator
+            for value_type in ("numeric", "text"):
+                result, adapter, _ = self.run_request(adapter=CatalogAdapter(chunks=[chunk(document(), original)]),
+                                                      client=StructuredClient(field_request("measurement", value_type),
+                                                                              evidence_response(name="measurement", value="16.00")))
+                self.assertTrue(result["success"], result)
+                self.assertEqual(result["fields"][0]["quote"], expected)
+                self.assertEqual(result["fields"][0]["quote"].count("16.00"), 2)
+                self.assert_public_source_evidence(result, adapter.chunks)
+
+    def test_text_matching_is_literal_across_spans_without_regex_or_whitespace_repair(self):
+        literal = "A[1].*\t\nnext line"
+        original = "Outside\nLabel\n" + literal + "\nUnit\nTail\nOutside end"
+        result, adapter, _ = self.run_request(adapter=CatalogAdapter(chunks=[chunk(document(), original)]),
+                                              client=StructuredClient(field_request(), evidence_response(value=literal)))
+        self.assertTrue(result["success"], result)
+        self.assertEqual(result["fields"][0]["quote"], "Label\n" + literal + "\nUnit\nTail\n")
+        self.assert_public_source_evidence(result, adapter.chunks)
+        for value_type, source, unsupported in (
+            ("text", "Visitor: Mira", "M.*"), ("text", "Label: A[1]", "A1"),
+            ("text", "Label: A\tB", "A B"), ("text", "Label: A\nB", "A B"),
+            ("text", "Rate: 16.00\t$", "$16.00"), ("text", "Visitor: Mira", ""),
+            ("numeric", "Rate: 16.00", " 16.00"), ("numeric", "Rate: 16.00", "16.00 "),
+            ("numeric", "Rate: 1e2", "100"), ("numeric", "Rate: -16.00", "16.00"),
+            ("numeric", "Rate: 116.00", "16.00"), ("numeric", "Rate: 16.00e2", "16.00"),
+        ):
+            with self.subTest(source=source, unsupported=unsupported):
+                result, _, _ = self.run_request(adapter=CatalogAdapter(chunks=[chunk(document(), source)]),
+                                                client=StructuredClient(field_request("measurement", value_type),
+                                                                        evidence_response(name="measurement", value=unsupported)))
+                self.assertEqual(result["status"], "invalid_evidence")
+                self.assertFalse(result["success"])
+
+    def test_all_matches_and_context_must_fit_quote_limit_without_truncation(self):
+        for original, value in (
+            ("Visitor: Mira\n" + "x" * engine.MAX_QUOTE_BYTES + "\nVisitor: Mira", "Mira"),
+            ("Label: " + "x" * engine.MAX_QUOTE_BYTES + "\nVisitor: Mira\nUnit\nTail", "Mira"),
+            ("Visitor: Mira\nUnit\n" + "x" * engine.MAX_QUOTE_BYTES, "Mira"),
+            ("Measurement: 16.00\n" + "x" * engine.MAX_QUOTE_BYTES + "\nMeasurement: 16.00", "16.00"),
+        ):
+            response = evidence_response(value=value)
+            value_type = "numeric" if value == "16.00" else "text"
+            result, adapter, client = self.run_request(adapter=CatalogAdapter(chunks=[chunk(document(), original)]),
+                                                       client=StructuredClient(field_request(value_type=value_type), response))
+            self.assertEqual(result["status"], "malformed_model_output")
+            self.assertFalse(result["success"])
+            self.assertEqual(len(client.calls), 2)
+            self.assertEqual(adapter.chunks[0]["text"], original)
+        for extra, expected in ((0, "success"), (1, "malformed_model_output")):
+            original = "Mira" + "é" * ((engine.MAX_QUOTE_BYTES - 4) // 2) + "x" * extra
+            result, _, _ = self.run_request(adapter=CatalogAdapter(chunks=[chunk(document(), original)]))
+            self.assertEqual(result["status"], expected)
+
+    def test_early_source_failure_preserves_requested_field_order_and_partial_results(self):
+        planning = {"task_type": "field_extraction", "fields": [
+            {"name": "optional_label", "value_type": "text"}, {"name": "visitor", "value_type": "text"},
+            {"name": "measurement", "value_type": "numeric"},
+        ]}
+        response = evidence_response(name="measurement", value="16")
+        response["fields"] += evidence_response()["fields"]
+        result, _, _ = self.run_request(adapter=CatalogAdapter(chunks=[chunk(document(), "Visitor: Mira\nMeasurement: 16.00")]),
+                                        client=StructuredClient(planning, response))
+        self.assertEqual(result["status"], "invalid_evidence")
+        self.assertFalse(result["success"])
+        self.assertEqual([field["name"] for field in result["fields"]], [field["name"] for field in planning["fields"]])
+        self.assertEqual([field["status"] for field in result["fields"]], ["missing", "found", "invalid_evidence"])
+        self.assertEqual([error["code"] for error in result["errors"]], ["missing_field", "invalid_evidence"])
+
     def test_span_view_overhead_is_included_in_actual_message_limit(self):
-        text = "evidence\n" * 64
+        text = "evidence detailed record\n" * 64
         rankings = [[ranked_chunk(f"query-{query}-rank-{rank}", text) for rank in range(4)] for query in range(4)]
         adapter = RankedAdapter(rankings)
         result, _, client = self.run_request(adapter=adapter, client=StructuredClient(requested_fields(4)))
@@ -293,6 +486,65 @@ class DocumentPipelineV06cTests(unittest.TestCase):
         self.assertEqual(len(client.calls), 1)
         self.assertEqual(len(adapter.search_calls), 4)
         self.assertTrue(all(item["text"] == text for row in rankings for item in row))
+
+    def test_seven_chunks_244_spans_fit_compact_view_with_identical_source_and_reconstruction(self):
+        originals = [ranked_chunk(
+            f"compact-chunk-{index}",
+            "".join(f"Évidence {index}:{line:02d}\tmarker record.\r\n" for line in range(count)),
+        ) for index, count in enumerate((35, 35, 35, 35, 35, 35, 34))]
+        rankings = [originals[::2], originals[1::2]]
+        planning = {"task_type": "field_extraction", "fields": [
+            {"name": "marker_label", "value_type": "text"},
+            {"name": "line_label", "value_type": "text"},
+        ]}
+        response = evidence_response(name="marker_label", value="marker record.", chunk_ref="c7")
+        response["fields"] += evidence_response(name="line_label", value="Évidence 0:01")["fields"]
+        real_builder = pipeline._evidence_spans
+        lookups = {}
+
+        def render(chunks, expanded=False):
+            view, lookup = real_builder(chunks)
+            lookups["expanded" if expanded else "compact"] = copy.deepcopy(lookup)
+            if expanded:
+                view = [{"chunk_ref": item["chunk_ref"], "spans": [
+                    {"span": number, "text": text} for number, text in item["spans"]
+                ]} for item in view]
+            return view, lookup
+
+        request = "Extract marker_label and line_label from arrival-card.txt."
+        with patch.object(pipeline, "_evidence_spans", side_effect=render):
+            result, _, client = self.run_request(request, adapter=RankedAdapter(rankings), client=StructuredClient(planning, response))
+        self.assertTrue(result["success"], result)
+        self.assertEqual(result["pipeline_version"], "0.6g")
+        messages = client.calls[1]["messages"]
+        compact = json.loads(messages[1]["content"])
+        self.assertEqual(len(compact["chunks"]), 7)
+        self.assertEqual(sum(len(item["spans"]) for item in compact["chunks"]), 244)
+        for view, original in zip(compact["chunks"], originals):
+            self.assertTrue(all(isinstance(pair, list) and len(pair) == 2 for pair in view["spans"]))
+            self.assertEqual(view_text(view), original["text"])
+            self.assertEqual([pair[0] for pair in view["spans"]], list(range(1, len(view["spans"]) + 1)))
+        expanded = copy.deepcopy(compact)
+        for item in expanded["chunks"]:
+            item["spans"] = [{"span": number, "text": text} for number, text in item["spans"]]
+        expanded_messages = copy.deepcopy(messages)
+        expanded_messages[1]["content"] = json.dumps(expanded, ensure_ascii=False, separators=(",", ":"))
+        compact_bytes = len(json.dumps(messages, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        expanded_bytes = len(json.dumps(expanded_messages, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        self.assertEqual(pipeline.MAX_MESSAGE_BYTES, 16384)
+        self.assertLessEqual(compact_bytes, 16384, f"compact={compact_bytes}, expanded={expanded_bytes}")
+        self.assertGreater(expanded_bytes, 16384, f"compact={compact_bytes}, expanded={expanded_bytes}")
+        with patch.object(pipeline, "_evidence_spans", side_effect=lambda chunks: render(chunks, expanded=True)):
+            rejected, _, stopped_client = self.run_request(request, adapter=RankedAdapter(rankings), client=StructuredClient(planning))
+        self.assertEqual(rejected["status"], "model_input_too_large")
+        self.assertEqual(len(stopped_client.calls), 1)
+        self.assertEqual(lookups["compact"], lookups["expanded"])
+        fields = result["extraction_request"]["fields"]
+        self.assertEqual(pipeline._engine_response(response, fields, lookups["compact"]),
+                         pipeline._engine_response(response, fields, lookups["expanded"]))
+        self.assertEqual(result["fields"][0]["quote"], originals[6]["text"])
+        self.assertEqual(result["fields"][1]["quote"], "".join(originals[0]["text"].splitlines(keepends=True)[:4]))
+        self.assert_public_source_evidence(result, originals)
 
     def test_reconstructed_quote_size_bound_is_not_relaxed_or_truncated(self):
         original = "Measurement: 16.00 " + "x" * engine.MAX_QUOTE_BYTES
@@ -307,11 +559,10 @@ class DocumentPipelineV06cTests(unittest.TestCase):
     def test_span_backed_partial_and_ambiguous_results_keep_distinct_source_evidence(self):
         originals = [ranked_chunk("original-a", "Visitor: Mira.\r\nTeam: Blue."), ranked_chunk("original-b", "Visitor: Rin.")]
         for ambiguous in (False, True):
-            response = evidence_response(start_span=1, end_span=1)
+            response = evidence_response()
             if ambiguous:
-                response["fields"][0]["status"] = "ambiguous"
                 response["fields"][0]["candidates"] += evidence_response(value="Rin", chunk_ref="c2")["fields"][0]["candidates"]
-            response["fields"].append({"name": "optional_label", "status": "missing", "candidates": []})
+            response["fields"].append({"name": "optional_label", "candidates": []})
             planning = {"task_type": "field_extraction", "fields": [
                 {"name": "visitor", "value_type": "text"}, {"name": "optional_label", "value_type": "text"},
             ]}
@@ -321,9 +572,9 @@ class DocumentPipelineV06cTests(unittest.TestCase):
             self.assertFalse(result["success"])
             self.assertEqual(result["fields"][1]["status"], "missing")
             if ambiguous:
-                self.assertEqual([item["quote"] for item in result["fields"][0]["candidates"]], ["Visitor: Mira.\r\n", "Visitor: Rin."])
+                self.assertEqual([item["quote"] for item in result["fields"][0]["candidates"]], [originals[0]["text"], "Visitor: Rin."])
             else:
-                self.assertEqual(result["fields"][0]["quote"], "Visitor: Mira.\r\n")
+                self.assertEqual(result["fields"][0]["quote"], originals[0]["text"])
             self.assert_public_source_evidence(result, originals)
 
     def test_two_unrelated_documents_generic_text_numeric_and_exact_scope(self):
@@ -521,18 +772,25 @@ class DocumentPipelineV06cTests(unittest.TestCase):
         self.assertEqual([item["max_output_tokens"] for item in client.calls], [768, 1536])
         self.assertEqual([item["schema_name"] for item in client.calls], ["document_request_v06c", "document_extract_v06g"])
         fields = field_request()["fields"]
-        self.assertEqual(client.calls[1]["response_schema"], pipeline.response_schema(fields, ["c1"]))
-        candidate_schema = pipeline.response_schema(fields, ["c1"])["properties"]["fields"]["items"]["properties"]["candidates"]["items"]["properties"]
+        _, lookup = pipeline._evidence_spans(adapter.chunks)
+        self.assertEqual(client.calls[1]["response_schema"], pipeline.response_schema(fields, lookup))
+        branch = client.calls[1]["response_schema"]["properties"]["fields"]["items"]["anyOf"][0]
+        candidate_schema = branch["properties"]["candidates"]["items"]["anyOf"][0]["properties"]
         self.assertEqual(candidate_schema["value"]["type"], "string")
         first_input = json.loads(client.calls[0]["messages"][1]["content"])
         second_input = json.loads(client.calls[1]["messages"][1]["content"])
         self.assertNotIn("chunks", first_input)
         self.assertEqual(view_text(second_input["chunks"][0]), adapter.chunks[0]["text"])
         self.assertEqual(set(second_input["chunks"][0]), {"chunk_ref", "spans"})
-        self.assertEqual(second_input["chunks"][0]["spans"][0]["span"], 1)
+        self.assertEqual(second_input["chunks"][0]["spans"][0][0], 1)
+        self.assertIn("[span_number, original_text]", client.calls[1]["messages"][0]["content"])
+        self.assertIn("never return span numbers", client.calls[1]["messages"][0]["content"])
         self.assertNotIn("response_schema", second_input)
         self.assertIn("untrusted DATA", client.calls[1]["messages"][0]["content"])
-        self.assertIn("Retain units", client.calls[1]["messages"][0]["content"])
+        self.assertIn("label/unit context", client.calls[1]["messages"][0]["content"])
+        self.assertIn("one strongest candidate when supporting mentions agree", client.calls[1]["messages"][0]["content"])
+        self.assertIn("same value do not require multiple candidates", client.calls[1]["messages"][0]["content"])
+        self.assertIn("different plausible supported values as separate candidates", client.calls[1]["messages"][0]["content"])
         for call in client.calls:
             self.assertLessEqual(len(json.dumps(call["messages"], ensure_ascii=False, separators=(",", ":")).encode()), 16384)
 
@@ -668,7 +926,7 @@ class DocumentPipelineV06cTests(unittest.TestCase):
         for index, (name, value, quote) in enumerate(zip(names, values, quotes)):
             fact = ranked_chunk(f"fact-{index}", quote)
             rankings.append([ranked_chunk(f"boilerplate-{rank}") for rank in range(3)] + [fact])
-            field = evidence_response(name=name, value=value, chunk_ref=f"c{index + 4}", end_span=2)["fields"][0]
+            field = evidence_response(name=name, value=value, chunk_ref=f"c{index + 4}")["fields"][0]
             fields.append(field)
         planning = {"task_type": "field_extraction", "fields": [{"name": name, "value_type": "numeric"} for name in names]}
         adapter = RankedAdapter(rankings)
@@ -704,8 +962,8 @@ class DocumentPipelineV06cTests(unittest.TestCase):
         ]}
         quote = "Measurement:\t16.00\nunits."
         for value, expected in (("16.00", "missing"), ("1", "invalid_evidence")):
-            response = evidence_response(name="measurement", value=value, end_span=2)
-            response["fields"].append({"name": "label", "status": "missing", "candidates": []})
+            response = evidence_response(name="measurement", value=value)
+            response["fields"].append({"name": "label", "candidates": []})
             adapter = CatalogAdapter(chunks=[chunk(document(), quote)])
             result, _, _ = self.run_request(adapter=adapter, client=StructuredClient(planning, response))
             self.assertEqual(result["status"], expected)
@@ -716,7 +974,7 @@ class DocumentPipelineV06cTests(unittest.TestCase):
                 self.assertEqual(result["fields"][0]["quote"], quote)
                 self.assertEqual(result["fields"][1]["status"], "missing")
 
-    def test_mixed_schema_sent_to_client_binds_numeric_names_to_numeric_branch(self):
+    def test_mixed_schema_sent_to_client_binds_numeric_names_to_source_literals(self):
         fields = [
             {"name": "occupancy_limit", "value_type": "numeric"},
             {"name": "booking_label", "value_type": "text"},
@@ -725,8 +983,10 @@ class DocumentPipelineV06cTests(unittest.TestCase):
         opener = Mock(side_effect=[Response({"choices": [{"message": {"content": json.dumps(output)}}]})
                                    for output in (planning, {"task_type": "field_extraction", "fields": []})])
         client = pipeline.IntentLMStudioClient(opener=opener)
+        originals = [chunk(document(), "Capacity: 120\nBooking: 120 people.")]
         result, _, _ = self.run_request(
-            "Extract occupancy_limit and booking_label from arrival-card.txt.", client=client,
+            "Extract occupancy_limit and booking_label from arrival-card.txt.",
+            adapter=CatalogAdapter(chunks=originals), client=client,
         )
         self.assertEqual(result["status"], "missing")
         self.assertEqual(opener.call_count, 2)
@@ -734,89 +994,225 @@ class DocumentPipelineV06cTests(unittest.TestCase):
         self.assertEqual(body["max_tokens"], 1536)
         schema = body["response_format"]["json_schema"]["schema"]
         items = schema["properties"]["fields"]["items"]
-        # No permissive sibling properties or unbound fallback branch.
         self.assertEqual(set(items), {"anyOf"})
         self.assertEqual(len(items["anyOf"]), 2)
-        base = engine.extraction_response_schema()["properties"]["fields"]["items"]
-        matched_names = set()
         for branch in items["anyOf"]:
             self.assertEqual(branch["type"], "object")
             self.assertFalse(branch["additionalProperties"])
-            self.assertEqual(branch["required"], base["required"])
-            self.assertEqual(branch["properties"]["status"], base["properties"]["status"])
+            self.assertEqual(branch["required"], ["name", "candidates"])
+            self.assertEqual(list(branch["properties"]), ["name", "candidates"])
             candidates = branch["properties"]["candidates"]
-            self.assertEqual(candidates["maxItems"], base["properties"]["candidates"]["maxItems"])
-            candidate = candidates["items"]
+            self.assertEqual((candidates["minItems"], candidates["maxItems"]), (0, engine.MAX_CANDIDATES))
+            self.assertEqual(set(candidates["items"]), {"anyOf"})
+            candidate = candidates["items"]["anyOf"][0]
+            self.assertEqual(candidate["type"], "object")
             self.assertFalse(candidate["additionalProperties"])
-            self.assertEqual(set(candidate["required"]), {"value", "chunk_ref", "start_span", "end_span"})
+            self.assertEqual(set(candidate["required"]), {"value", "chunk_ref"})
             self.assertEqual(set(candidate["properties"]), set(candidate["required"]))
-            self.assertEqual(candidate["properties"]["chunk_ref"], {"type": "string", "enum": ["c1"]})
-            for key in ("start_span", "end_span"):
-                self.assertEqual(candidate["properties"][key], {"type": "integer", "minimum": 1, "maximum": 64})
-            for key in ("source", "chunk_id", "location", "quote"):
-                self.assertNotIn(key, candidate["properties"])
+            self.assertEqual(candidate["properties"]["chunk_ref"], {"type": "string", "const": "c1"})
             value = candidate["properties"]["value"]
             self.assertEqual(value["type"], "string")
-            self.assertEqual(value["maxLength"], engine.MAX_QUOTE_BYTES)
-            names = set(branch["properties"]["name"]["enum"])
-            self.assertTrue(matched_names.isdisjoint(names))
-            matched_names.update(names)
-            if "pattern" in value:
-                self.assertEqual(names, {"occupancy_limit"})
-                self.assertEqual(value["pattern"], r"^[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+)?$")
+            if branch["properties"]["name"]["enum"] == ["occupancy_limit"]:
+                self.assertEqual(value["enum"], ["120"])
             else:
-                self.assertEqual(names, {"booking_label"})
-                self.assertNotIn("occupancy_limit", names)
-        self.assertEqual(matched_names, {field["name"] for field in fields})
+                self.assertEqual(branch["properties"]["name"]["enum"], ["booking_label"])
+                self.assertNotIn("enum", value)
+                self.assertEqual(value["maxLength"], engine.MAX_QUOTE_BYTES)
+        for name, value, accepted in (("occupancy_limit", "120 people", False),
+                                      ("occupancy_limit", "120", True), ("booking_label", "120 people", True)):
+            self.assertEqual(schema_accepts(items, evidence_response(name=name, value=value)["fields"][0]), accepted)
 
-    def test_single_type_schema_uses_one_complete_grouped_object(self):
-        for value_type in ("text", "numeric"):
-            with self.subTest(value_type=value_type):
-                requested = engine.validate_extraction_request({
-                    "task_type": "field_extraction",
-                    "fields": [{"name": f"field_{i}", "question": f"What is field {i}?", "value_type": value_type}
-                               for i in range(3)],
-                })
-                schema = pipeline.response_schema(requested["fields"], ["c1"])
-                self.assertEqual(schema["properties"]["fields"]["maxItems"], engine.MAX_FIELDS)
-                items = schema["properties"]["fields"]["items"]
-                self.assertNotIn("anyOf", items)
-                self.assertEqual(items["type"], "object")
-                self.assertFalse(items["additionalProperties"])
-                self.assertEqual(items["properties"]["name"]["enum"], ["field_0", "field_1", "field_2"])
-                value = items["properties"]["candidates"]["items"]["properties"]["value"]
-                self.assertEqual("pattern" in value, value_type == "numeric")
+    def test_schema_groups_names_into_one_complete_object_per_requested_type(self):
+        for types in (("text",), ("numeric",), ("numeric", "text")):
+            fields = [{"name": f"field_{index}", "value_type": types[index % len(types)]}
+                      for index in range(engine.MAX_FIELDS)]
+            _, lookup = pipeline._evidence_spans([chunk(document(), "Measurement: 16.00 units")])
+            schema = pipeline.response_schema(fields, lookup)
+            self.assertEqual(schema["properties"]["fields"]["maxItems"], engine.MAX_FIELDS)
+            items = schema["properties"]["fields"]["items"]
+            self.assertEqual(set(items), {"anyOf"})
+            self.assertEqual(len(items["anyOf"]), len(types))
+            for branch in items["anyOf"]:
+                self.assertFalse(branch["additionalProperties"])
+                self.assertEqual(list(branch["properties"]), ["name", "candidates"])
+                value = branch["properties"]["candidates"]["items"]["anyOf"][0]["properties"]["value"]
+                value_type = "numeric" if "enum" in value else "text"
+                self.assertEqual(branch["properties"]["name"]["enum"],
+                                 [field["name"] for field in fields if field["value_type"] == value_type])
 
-    def test_mixed_schema_groups_maximum_fields_into_only_two_branches(self):
-        fields = engine.validate_extraction_request({
-            "task_type": "field_extraction",
-            "fields": [{"name": f"field_{i}", "question": f"What is field {i}?",
-                        "value_type": "text" if i % 2 else "numeric"}
-                       for i in range(engine.MAX_FIELDS)],
-        })["fields"]
-        items = pipeline.response_schema(fields, ["c1"])["properties"]["fields"]["items"]
-        self.assertEqual(set(items), {"anyOf"})
-        self.assertEqual(len(items["anyOf"]), 2)
-        for branch in items["anyOf"]:
-            value = branch["properties"]["candidates"]["items"]["properties"]["value"]
-            value_type = "numeric" if "pattern" in value else "text"
-            self.assertEqual(branch["properties"]["name"]["enum"],
-                             [field["name"] for field in fields if field["value_type"] == value_type])
+    def test_numeric_enum_preserves_complete_literals_and_engine_bounds(self):
+        literals = ["120", "45.50", "-2.50e1", "+.5", "-0.00", "1.", "1e+2", "2E-3", "1e255", "1e-254"]
+        invalid = ["NaN", "Infinity", "1e", "1e+", "1e-", "1e.2", "--1", "+", ".", "1.2.3",
+                   "9" * (engine.MAX_RAW_NUMERIC_BYTES + 1), "1e10000000", "1e-10000000", "-1e255", "1e-255"]
+        original = "\n".join(literals + invalid + ["45.50"])
+        _, lookup = pipeline._evidence_spans([chunk(document(), original)])
+        schema = pipeline.response_schema(field_request("measurement", "numeric")["fields"], lookup)
+        items = schema["properties"]["fields"]["items"]
+        values = items["anyOf"][0]["properties"]["candidates"]["items"]["anyOf"][0]["properties"]["value"]
+        self.assertEqual(values, {"type": "string", "enum": literals})
+        for literal in literals:
+            self.assertTrue(schema_accepts(items, evidence_response(name="measurement", value=literal)["fields"][0]))
+        for literal in invalid + ["120 people", "18 hours", "number 120", "120 ", " 120", "45.5", "2e-3"]:
+            self.assertFalse(schema_accepts(items, evidence_response(name="measurement", value=literal)["fields"][0]))
 
-    def test_numeric_schema_pattern_accepts_only_complete_literals(self):
-        fields = engine.validate_extraction_request({"task_type": "field_extraction", "fields": [{
-            "name": "measurement", "question": "What is the measurement?", "value_type": "numeric",
-        }]})["fields"]
-        items = pipeline.response_schema(fields, ["c1"])["properties"]["fields"]["items"]
-        value_schema = items["properties"]["candidates"]["items"]["properties"]["value"]
-        pattern = value_schema["pattern"]
-        for literal in ("120", "45.50", "-2.50e1", "+.5", "-0.00", "1.", "1e+2", "2E-3"):
+    def test_empty_numeric_alternatives_permit_only_empty_candidate_lists(self):
+        fields = field_request("measurement", "numeric")["fields"]
+        for original in ("No numeric evidence.", "1e1000000\n" + "9" * 129):
+            _, lookup = pipeline._evidence_spans([chunk(document(), original)])
+            schema = pipeline.response_schema(fields, lookup)
+            response = evidence_response(name="measurement", value="1")
+            self.assertFalse(schema_accepts(schema, response))
+            result, _, _ = self.run_request(adapter=CatalogAdapter(chunks=[chunk(document(), original)]),
+                                            client=StructuredClient(field_request("measurement", "numeric"), response))
+            self.assertEqual(result["status"], "invalid_evidence")
+            response["fields"][0]["candidates"] = []
+            self.assertTrue(schema_accepts(schema, response))
+            result, _, _ = self.run_request(adapter=CatalogAdapter(chunks=[chunk(document(), original)]),
+                                            client=StructuredClient(field_request("measurement", "numeric"), response))
+            self.assertEqual(result["status"], "missing")
+            self.assertEqual(result["fields"][0]["status"], "missing")
+
+    def test_minimal_field_schema_limits_candidate_count_and_rejects_status(self):
+        fields = [{"name": "label", "value_type": "text"}, {"name": "capacity", "value_type": "numeric"}]
+        _, lookup = pipeline._evidence_spans([chunk(document(), "Label: 18 hours\nCapacity: +.5")])
+        items = pipeline.response_schema(fields, lookup)["properties"]["fields"]["items"]
+        for name, value in (("label", "18 hours"), ("capacity", "+.5")):
+            for count in range(engine.MAX_CANDIDATES + 2):
+                field = evidence_response(name=name, value=value)["fields"][0]
+                field["candidates"] *= count
+                self.assertEqual(schema_accepts(items, field), count <= engine.MAX_CANDIDATES)
+                for status in ("found", "missing", "ambiguous", "invalid_status"):
+                    self.assertFalse(schema_accepts(items, {**field, "status": status}))
+        self.assertFalse(schema_accepts(items, evidence_response(name="unknown")["fields"][0]))
+
+    def test_numeric_enum_binds_exact_spelling_to_correct_chunk_without_fallback(self):
+        fields = [{"name": "label", "value_type": "text"}, {"name": "measurement", "value_type": "numeric"}]
+        originals = [ranked_chunk("a", "Measurement: 16.00"), ranked_chunk("b", "Measurement: -2.50e1\nOther: +.5"),
+                     ranked_chunk("c", "No numeric evidence.")]
+        _, lookup = pipeline._evidence_spans(originals)
+        schema = pipeline.response_schema(fields, lookup)
+        branches = schema["properties"]["fields"]["items"]["anyOf"]
+        for branch in branches:
+            numeric = branch["properties"]["name"]["enum"] == ["measurement"]
+            alternatives = branch["properties"]["candidates"]["items"]["anyOf"]
+            self.assertEqual([item["properties"]["chunk_ref"]["const"] for item in alternatives],
+                             ["c1", "c2"] if numeric else ["c1", "c2", "c3"])
+            for candidate in alternatives:
+                self.assertEqual(set(candidate), {"type", "additionalProperties", "required", "properties"})
+                self.assertEqual(set(candidate["required"]), {"value", "chunk_ref"})
+                self.assertEqual(set(candidate["properties"]), {"value", "chunk_ref"})
+                self.assertFalse(candidate["additionalProperties"])
+        for reference, value, accepted in (("c1", "16.00", True), ("c1", "16", False), ("c1", "-2.50e1", False),
+                                            ("c2", "16.00", False), ("c2", "-2.50e1", True), ("c2", "+.5", True),
+                                            ("c3", "16.00", False), ("c99", "16.00", False)):
+            response = evidence_response(name="measurement", value=value, chunk_ref=reference)
+            self.assertEqual(schema_accepts(schema, response), accepted)
+            for key in ("start_span", "end_span", "start_offset", "end_offset", "quote", "source", "chunk_id", "location", "status"):
+                bad = copy.deepcopy(response)
+                bad["fields"][0]["candidates"][0][key] = 1
+                self.assertFalse(schema_accepts(schema, bad))
+
+    def test_correct_values_with_previously_wrong_ranges_need_no_coordinates(self):
+        originals = [ranked_chunk(f"source-{index}", "Visitor: Mira.\n" * count)
+                     for index, count in enumerate((53, 1, 1, 1, 1, 14))]
+        planning = {"task_type": "field_extraction", "fields": [
+            {"name": "visitor", "value_type": "text"}, {"name": "optional_label", "value_type": "text"},
+        ]}
+        response = evidence_response(chunk_ref="c6")
+        result, _, client = self.run_request(adapter=RankedAdapter([originals[::2], originals[1::2]]),
+                                            client=StructuredClient(planning, response))
+        self.assertEqual(result["status"], "missing")
+        self.assertEqual(result["fields"][0]["status"], "found")
+        self.assertEqual(result["fields"][0]["quote"], originals[5]["text"])
+        self.assertEqual(len(client.calls), 2)
+        _, lookup = pipeline._evidence_spans(originals)
+        schema = client.calls[1]["response_schema"]
+        self.assertEqual(schema, pipeline.response_schema(planning["fields"], lookup))
+        self.assertTrue(schema_accepts(schema, response))
+        self.assert_public_source_evidence(result, originals)
+
+    def test_maximum_generated_schema_fits_existing_client_size_bound(self):
+        fields = engine.validate_extraction_request({"task_type": "field_extraction", "fields": [
+            {"name": f"field_{index}_" + "x" * (engine.MAX_FIELD_NAME_BYTES - 8),
+             "question": "What is the requested field?", "value_type": "numeric" if index % 2 else "text"}
+            for index in range(engine.MAX_FIELDS)
+        ]})["fields"]
+        originals = [ranked_chunk(f"chunk-{index}", "\n".join(f"Metric: {index}{number:03d}.00" for number in range(64)))
+                     for index in range(engine.MAX_CHUNKS)]
+        _, lookup = pipeline._evidence_spans(originals)
+        schema = pipeline.response_schema(fields, lookup)
+        self.assertTrue(all(len(field["name"]) == engine.MAX_FIELD_NAME_BYTES for field in fields))
+        schema_bytes = json.dumps(schema, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        self.assertEqual(lm_module.MAX_INTENT_BYTES, 64 * 1024)
+        self.assertLessEqual(len(schema_bytes), lm_module.MAX_INTENT_BYTES)
+
+        def check_alternatives(node):
+            if isinstance(node, dict):
+                self.assertTrue({"if", "then", "dependencies"}.isdisjoint(node))
+                if "anyOf" in node:
+                    self.assertEqual(set(node), {"anyOf"})
+                    for branch in node["anyOf"]:
+                        self.assertEqual(branch["type"], "object")
+                        self.assertFalse(branch["additionalProperties"])
+                        self.assertEqual(set(branch["properties"]), set(branch["required"]))
+                for nested in node.values():
+                    check_alternatives(nested)
+            elif isinstance(node, list):
+                for nested in node:
+                    check_alternatives(nested)
+
+        check_alternatives(schema)
+        output = {"task_type": "field_extraction", "fields": []}
+        opener = Mock(return_value=Response({"choices": [{"message": {"content": json.dumps(output)}}]}))
+        client = pipeline.IntentLMStudioClient(opener=opener)
+        self.assertEqual(json.loads(client.generate_structured(
+            [{"role": "user", "content": "Offline schema size check"}], response_schema=schema,
+            schema_name="document_extract_v06g", max_output_tokens=1536,
+        )), output)
+        self.assertEqual(opener.call_count, 1)
+        self.assertEqual(json.loads(opener.call_args.args[0].data)["response_format"]["json_schema"]["schema"], schema)
+
+    def test_oversized_numeric_enum_schema_is_rejected_without_dropping_literals(self):
+        originals = [ranked_chunk(f"chunk-{index}", " ".join(str(100000 + index * 2000 + number) for number in range(900)))
+                     for index in range(engine.MAX_CHUNKS)]
+        self.assertLessEqual(sum(len(item["text"].encode()) for item in originals), engine.MAX_TOTAL_CHUNK_BYTES)
+        _, lookup = pipeline._evidence_spans(originals)
+        with self.assertRaises(pipeline.PipelineError) as caught:
+            pipeline.response_schema(field_request("measurement", "numeric")["fields"], lookup)
+        self.assertEqual(caught.exception.code, "model_input_too_large")
+        self.assertTrue(all(len(pipeline._numeric_literals(item["text"])) == 900 for item in originals))
+
+    def test_exact_source_literals_still_obey_numeric_engine_bounds_without_schema_enforcement(self):
+        for literal, supported in (
+            ("1e255", True), ("1e-254", True), ("9" * engine.MAX_RAW_NUMERIC_BYTES, True),
+            ("1e256", False), ("1e-255", False), ("9" * (engine.MAX_RAW_NUMERIC_BYTES + 1), False),
+            ("1e1000000", False), ("NaN", False), ("Infinity", False), ("1_000", False),
+        ):
             with self.subTest(literal=literal):
-                self.assertIsNotNone(re.search(pattern, literal))
-        for literal in ("120 people", "18 hours", "NaN", "Infinity", "1e", "1e+", "1e-", "1e.2",
-                        "number 120", "120 ", " 120", "--1", "+", ".", "1.2.3"):
-            with self.subTest(literal=literal):
-                self.assertIsNone(re.search(pattern, literal))
+                original = "Measurement: " + literal + " units"
+                result, _, client = self.run_request(adapter=CatalogAdapter(chunks=[chunk(document(), original)]),
+                                                      client=StructuredClient(field_request("measurement", "numeric"),
+                                                                              evidence_response(name="measurement", value=literal)))
+                self.assertEqual(result["status"], "success" if supported else "invalid_evidence")
+                self.assertEqual(result["success"], supported)
+                self.assertEqual(len(client.calls), 2)
+
+    def test_model_output_and_public_result_size_limits_remain_enforced(self):
+        for stage in (0, 1):
+            for extra in (0, 1):
+                raw = json.dumps(field_request() if stage == 0 else evidence_response())
+                raw += " " * (engine.MAX_MODEL_RESPONSE_BYTES - len(raw.encode()) + extra)
+                outputs = [raw, evidence_response()] if stage == 0 else [field_request(), raw]
+                result, _, client = self.run_request(client=StructuredClient(*outputs))
+                self.assertEqual(result["status"], "malformed_model_output" if extra else "success")
+                self.assertEqual(len(client.calls), stage + 1 if extra else 2)
+        normal, _, _ = self.run_request()
+        result_bytes = len(json.dumps(normal, ensure_ascii=False, separators=(",", ":")).encode())
+        self.assertEqual(engine.MAX_RESULT_BYTES, 96 * 1024)
+        for extra, status in ((0, "success"), (1, "result_too_large")):
+            with patch.object(engine, "MAX_RESULT_BYTES", result_bytes - extra):
+                result, _, _ = self.run_request()
+            self.assertEqual(result["status"], status)
 
     def test_mixed_extraction_preserves_numeric_literal_and_text_with_units(self):
         fields = [
@@ -829,7 +1225,7 @@ class DocumentPipelineV06cTests(unittest.TestCase):
                 text_quote = "Duration label: 18 hours."
                 response = evidence_response(name="measurement", value=literal)
                 response["fields"].extend(evidence_response(
-                    name="duration_label", value="18 hours", start_span=2, end_span=2,
+                    name="duration_label", value="18 hours",
                 )["fields"])
                 adapter = CatalogAdapter(chunks=[chunk(document(), quote + "\n" + text_quote)])
                 client = StructuredClient({"task_type": "field_extraction", "fields": fields}, response)
@@ -842,9 +1238,9 @@ class DocumentPipelineV06cTests(unittest.TestCase):
                 self.assertEqual(raw, literal)  # No stripping signs/zeros or JSON-number coercion.
                 self.assertIsInstance(raw, str)
                 self.assertEqual(result["fields"][0]["value"], normalized)
-                self.assertEqual(result["fields"][0]["quote"], quote + "\n")
+                self.assertEqual(result["fields"][0]["quote"], quote + "\n" + text_quote)
                 self.assertEqual(result["fields"][1]["value"], "18 hours")
-                self.assertEqual(result["fields"][1]["quote"], text_quote)
+                self.assertEqual(result["fields"][1]["quote"], quote + "\n" + text_quote)
                 self.assertFalse(result["execution_performed"])
                 self.assertEqual(result["evidence_validation"], pipeline.EVIDENCE_DISCLAIMER)
                 self.assertEqual(result["model_calls"], 2)
@@ -896,9 +1292,8 @@ class DocumentPipelineV06cTests(unittest.TestCase):
                 self.assertLessEqual(len(client.calls), 2)
 
     def test_missing_and_ambiguous_engine_results_are_preserved(self):
-        missing = {"task_type": "field_extraction", "fields": []}
+        missing = {"task_type": "field_extraction", "fields": [{"name": "visitor", "candidates": []}]}
         ambiguous = evidence_response()
-        ambiguous["fields"][0]["status"] = "ambiguous"
         second = copy.deepcopy(ambiguous["fields"][0]["candidates"][0])
         second.update({"value": "Rin"})
         ambiguous["fields"][0]["candidates"].append(second)
