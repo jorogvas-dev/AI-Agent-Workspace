@@ -165,6 +165,52 @@ function New-TestState {
     Release='E:\AI-Agent-Workspace\runtime\production\releases\release';ReleaseHash=$null;InternalNetwork=('f'*64);EgressId=$null;
     Baseline=[pscustomobject]@{Ui=[pscustomobject]@{users=2;chats=3};Knowledge=[pscustomobject]@{chunks=5;files=2;documents=2;identities='baseline'}}}
 }
+function New-TestMainServices {
+  $s=New-TestState;$entries=@()
+  $script:startup=[pscustomobject]@{Cmd=@('run');Entrypoint=$null;WorkingDir='/app';User=''}
+  $script:startupJson=@{container=@{};image=@{}}
+  $script:startupCalls=[Collections.Generic.List[object]]::new();$script:wholeStartupReads=0;$script:startupFailure=$null
+  foreach($name in @('open-webui','knowledge-service','chromadb')){
+    $entry=$script:containers[$s.Originals.$name.Id]
+    $entry.Raw.Config=$script:startup
+    $entry.Raw.HostConfig=[pscustomobject]@{ExtraHosts=$null;Privileged=$false;Devices=$null;DeviceRequests=$null;PortBindings=$null}
+    $entry.Raw.NetworkSettings.Networks=[pscustomobject]@{'agent-internal'=[pscustomobject]@{};bridge=[pscustomobject]@{}}
+    if($name -ne 'chromadb'){
+      $entry.Record.Image=(Get-ProdImages)[$(if($name -eq 'open-webui'){'webui'}else{'knowledge'})]
+      $s.Originals.$name.Image=$entry.Record.Image
+      foreach($kind in @('container','image')){
+        $reference=if($kind -eq 'container'){$entry.Record.Id}else{$entry.Record.Image}
+        $script:startupJson[$kind][$reference]=@{Cmd='["run"]';Entrypoint='null';WorkingDir='"/app"';User='""'}
+      }
+    }
+    $entries+=$entry
+  }
+  $entries[0].Record.Mounts=@([pscustomobject]@{Type='volume';Name='open-webui';Destination='/app/backend/data';RW=$true})+@(
+    foreach($name in @('output','scripts','temp')){[pscustomobject]@{Type='bind';Source="E:\AI-Agent-Workspace\$name";Destination="/workspace/$name";RW=$true}})
+  $entries[1].Record.Mounts=@([pscustomobject]@{Type='bind';Source='E:\AI-Agent-Workspace\input';Destination='/workspace/input';RW=$true},
+    [pscustomobject]@{Type='bind';Source='E:\AI-Agent-Workspace\knowledge';Destination='/workspace/knowledge';RW=$true})
+  $entries[2].Record.Mounts=@([pscustomobject]@{Type='bind';Source='E:\AI-Agent-Workspace\knowledge-db';Destination='/data';RW=$true})
+  [pscustomobject]@{State=$s;Entries=$entries}
+}
+$script:startupMocks=@{
+  'Invoke-ProdNative'={param($Kind,$Arguments,$Operation,$InputText)
+    $script:startupCalls.Add([pscustomobject]@{Kind=$Kind;Arguments=$Arguments})
+    Assert-Test ($Kind -ceq 'Docker' -and $Arguments.Count -eq 5 -and $Arguments[0] -cin @('container','image') -and
+      $Arguments[1] -ceq 'inspect' -and $Arguments[2] -ceq '--format') 'startup performs selected-field inspection only'
+    $match=[regex]::Match($Arguments[3],'^\{\{json \.Config\.(Cmd|Entrypoint|WorkingDir|User)\}\}$')
+    Assert-Test $match.Success 'exact selected startup template'
+    $setting=$match.Groups[1].Value;$reference=$Arguments[4]
+    Assert-Test ($script:startupJson[$Arguments[0]].ContainsKey($reference)) 'verified container ID or pinned image ID used'
+    if($script:startupFailure -ceq ($reference+':'+$setting)){throw 'SYNTHETIC_PRIVATE_INSPECTION_FAILURE'}
+    $script:startupJson[$Arguments[0]][$reference][$setting]
+  }
+  'Read-DockerJson'={param($Arguments)
+    $script:wholeStartupReads++
+    # Faithful legacy image inspect: omits the empty User default entirely.
+    [pscustomobject]@{Config=[pscustomobject]@{Cmd=@('run');Entrypoint=$null;WorkingDir='/app'}}
+  }
+  'Assert-NoReparse'={param($Path,[switch]$Tree)}
+}
 function New-TestReplacements($State,[int]$Count=3){
   $index=100
   $roles=@{'open-webui'='webui';'knowledge-service'='knowledge';'document-planner-prod'='planner'}
@@ -370,21 +416,8 @@ Test-Case 'captured port bindings preserve loopback IPv4 and IPv6 without broade
   Assert-Test (@($ports | Where-Object {$_.host_ip -in @('127.0.0.1','::1')}).Count -eq 2) 'no all-host default inserted'
 }
 Test-Case 'actual production mounts pass while unknown changed duplicate and wrong-mode mounts fail' {
-  $s=New-TestState;$script:startup=[pscustomobject]@{Cmd=@('run');Entrypoint=$null;WorkingDir='/app';User=''}
-  $entries=@()
-  foreach($name in @('open-webui','knowledge-service','chromadb')){
-    $entry=$script:containers[$s.Originals.$name.Id]
-    $entry.Raw | Add-Member -NotePropertyName Config -NotePropertyValue $script:startup -Force
-    $entry.Raw.HostConfig=[pscustomobject]@{ExtraHosts=$null;Privileged=$false;Devices=$null;DeviceRequests=$null;PortBindings=$null}
-    $entry.Raw.NetworkSettings.Networks=[pscustomobject]@{'agent-internal'=[pscustomobject]@{};bridge=[pscustomobject]@{}}
-    $entries+=$entry
-  }
-  $entries[0].Record.Mounts=@([pscustomobject]@{Type='volume';Name='open-webui';Destination='/app/backend/data';RW=$true})+@(
-    foreach($name in @('output','scripts','temp')){[pscustomobject]@{Type='bind';Source="E:\AI-Agent-Workspace\$name";Destination="/workspace/$name";RW=$true}})
-  $entries[1].Record.Mounts=@([pscustomobject]@{Type='bind';Source='E:\AI-Agent-Workspace\input';Destination='/workspace/input';RW=$true},
-    [pscustomobject]@{Type='bind';Source='E:\AI-Agent-Workspace\knowledge';Destination='/workspace/knowledge';RW=$true})
-  $entries[2].Record.Mounts=@([pscustomobject]@{Type='bind';Source='E:\AI-Agent-Workspace\knowledge-db';Destination='/data';RW=$true})
-  With-Mocks @{'Read-DockerJson'={param($Arguments) [pscustomobject]@{Config=$script:startup}};'Assert-NoReparse'={param($Path,[switch]$Tree)}} {
+  $fixture=New-TestMainServices;$s=$fixture.State;$entries=$fixture.Entries
+  With-Mocks $script:startupMocks {
     Assert-MainMounts $entries[0] $entries[1] $entries[2] 'E:\AI-Agent-Workspace'
     $original=$entries[0].Record.Mounts
     foreach($bad in @([pscustomobject]@{Type='bind';Source='E:\AI-Agent-Workspace\other';Destination='/other';RW=$true},$original[1])){
@@ -409,6 +442,102 @@ Test-Case 'actual production mounts pass while unknown changed duplicate and wro
     $entries[1].Raw.HostConfig.PortBindings=[pscustomobject]@{'8002/tcp'=@([pscustomobject]@{HostPort='8002'})}
     $null=Expect-Failure {Assert-MainMounts $entries[0] $entries[1] $entries[2] 'E:\AI-Agent-Workspace'} 'published ports'
   }
+}
+Test-Case 'selected startup inspection accepts matching empty defaults omitted by whole-image metadata' {
+  $fixture=New-TestMainServices;$entries=$fixture.Entries
+  With-Mocks $script:startupMocks {
+    $whole=Read-DockerJson @('image','inspect','--format','{{json .}}',$entries[0].Record.Image)
+    Assert-Test ($null -eq $whole.Config.PSObject.Properties['User'] -and $entries[0].Raw.Config.User -ceq '') 'whole-image fixture omits the empty default'
+    $script:wholeStartupReads=0
+    Assert-MainMounts $entries[0] $entries[1] $entries[2] $fixture.State.Root
+    Assert-Test ($script:wholeStartupReads -eq 0 -and $script:startupCalls.Count -eq 16) 'all four settings inspected by full container and pinned image IDs for both services'
+  }
+}
+Test-Case 'startup null empty single and multiple argument arrays retain their JSON structure' {
+  foreach($json in @('null','[]','["only"]','["first","","last"]')){
+    $fixture=New-TestMainServices;$entries=$fixture.Entries
+    foreach($kind in @('container','image')){foreach($fields in $script:startupJson[$kind].Values){$fields.Cmd=$json;$fields.Entrypoint=$json}}
+    # Insignificant JSON spacing may differ; argument order/empty strings may not.
+    $script:startupJson.image[$entries[0].Record.Image].Cmd=$json.Replace(',',', ')
+    With-Mocks $script:startupMocks {Assert-MainMounts $entries[0] $entries[1] $entries[2] $fixture.State.Root}
+  }
+}
+Test-Case 'actual startup differences and null array string or argument-order distinctions abort safely' {
+  $differences=@(
+    @{Setting='Cmd';Container='["run"]';Image='["SYNTHETIC_PRIVATE_ARG"]'},
+    @{Setting='Entrypoint';Container='["start"]';Image='["other"]'},
+    @{Setting='WorkingDir';Container='"/app"';Image='"/other"'},
+    @{Setting='User';Container='""';Image='"1000"'},
+    @{Setting='User';Container='"runner"';Image='"Runner"'},
+    @{Setting='Cmd';Container='null';Image='[]'},
+    @{Setting='Entrypoint';Container='null';Image='[]'},
+    @{Setting='Cmd';Container='[]';Image='[""]'},
+    @{Setting='Cmd';Container='["run"]';Image='["run",""]'},
+    @{Setting='Cmd';Container='["a","b"]';Image='["b","a"]'},
+    @{Setting='Entrypoint';Container='["a","b"]';Image='["b","a"]'},
+    @{Setting='WorkingDir';Container='null';Image='""'},
+    @{Setting='User';Container='null';Image='""'})
+  foreach($index in @(0,1)){foreach($difference in $differences){
+    $fixture=New-TestMainServices;$entries=$fixture.Entries;$entry=$entries[$index];$setting=$difference.Setting
+    $script:startupJson.container[$entry.Record.Id][$setting]=$difference.Container
+    $script:startupJson.image[$entry.Record.Image][$setting]=$difference.Image
+    With-Mocks $script:startupMocks {
+      $message=Expect-Failure {Assert-MainMounts $entries[0] $entries[1] $entries[2] $fixture.State.Root} ("Startup mismatch for $($entry.Record.Name) setting $setting")
+      Assert-Test (-not $message.Contains('SYNTHETIC_PRIVATE_ARG')) 'diagnostic identifies container/setting without values'
+    }
+  }}
+}
+Test-Case 'startup inspection rejects invalid JSON and invalid setting types without leaking output' {
+  $invalid=@(
+    @{Setting='Cmd';Json=''},@{Setting='Cmd';Json='{'},@{Setting='Cmd';Json='null extra'},
+    @{Setting='Cmd';Json='[],"setting":[]'},@{Setting='Cmd';Json='["one"] ["two"]'},
+    @{Setting='Cmd';Json='"scalar"'},@{Setting='Cmd';Json='[null]'},@{Setting='Cmd';Json='[1]'},
+    @{Setting='Entrypoint';Json='[["nested"]]'},@{Setting='Entrypoint';Json='{}'},
+    @{Setting='WorkingDir';Json='[]'},@{Setting='User';Json='false'})
+  foreach($kind in @('container','image')){foreach($bad in $invalid){
+    $fixture=New-TestMainServices;$entries=$fixture.Entries;$entry=$entries[0]
+    $reference=if($kind -eq 'container'){$entry.Record.Id}else{$entry.Record.Image}
+    $script:startupJson[$kind][$reference][$bad.Setting]=$bad.Json
+    With-Mocks $script:startupMocks {
+      $null=Expect-Failure {Assert-MainMounts $entries[0] $entries[1] $entries[2] $fixture.State.Root} ("Startup inspection failed for open-webui setting $($bad.Setting)")
+    }
+  }}
+}
+Test-Case 'Prepare aborts on selected inspection failures or invalid JSON before any mutation' {
+  foreach($kind in @('container','image')){foreach($failure in @('inspection','json')){
+    $fixture=New-TestMainServices;$s=$fixture.State;$entry=$fixture.Entries[1];$script:unexpectedMutation=0
+    $reference=if($kind -eq 'container'){$entry.Record.Id}else{$entry.Record.Image}
+    if($failure -eq 'inspection'){$script:startupFailure=$reference+':User'}else{$script:startupJson[$kind][$reference].User='{SYNTHETIC_PRIVATE_JSON'}
+    With-Mocks $script:startupMocks {
+      With-Mocks @{
+        'Find-ProdContainer'=$script:orchestration['Find-ProdContainer'];'Read-ProdContainer'=$script:orchestration['Read-ProdContainer']
+        'Read-DockerJson'={param($Arguments)
+          if($Arguments[0] -eq 'network'){return [pscustomobject]@{Name='agent-internal';Id=('f'*64)}}
+          if($Arguments[0] -eq 'image' -and $Arguments[3] -ceq '{{json .Id}}'){return $Arguments[4]}
+          throw 'TEST: unexpected whole-object startup inspection'
+        }
+        'Invoke-ProdNative'={param($Kind,$Arguments,$Operation,$InputText)
+          if($Kind -eq 'Git'){
+            if($Arguments -contains 'rev-parse'){return ('a'*40)}
+            if($Arguments -contains 'diff'){return ''}
+            if($Arguments -contains 'ls-tree'){return 'scripts/document_service_production.py'}
+          }
+          if($Kind -eq 'Docker'){
+            if($Arguments[0] -eq 'compose'){return '5.6.1'}
+            if(($Arguments[0] -eq 'container' -and $Arguments[1] -eq 'ls') -or $Arguments[0] -eq 'network'){return ''}
+            if($Arguments[1] -eq 'inspect'){return & ($script:startupMocks['Invoke-ProdNative']) $Kind $Arguments $Operation $InputText}
+          }
+          $script:unexpectedMutation++;throw 'TEST: unexpected native mutation'
+        }
+        'Assert-DatabaseConfiguration'={throw 'TEST: must abort before credential validation'}
+        'New-PrivateDirectory'={$script:unexpectedMutation++;throw 'TEST: must not create private files'}
+        'Save-ProdState'={$script:unexpectedMutation++;throw 'TEST: must not write state'}
+      } {
+        $message=Expect-Failure {Invoke-ProdPrepare ('a'*40)} 'Startup inspection failed for knowledge-service setting User'
+        Assert-Test ($script:unexpectedMutation -eq 0 -and -not $message.Contains('SYNTHETIC_PRIVATE')) 'failure precedes mutations and withholds native/JSON details'
+      }
+    }
+  }}
 }
 Test-Case 'native errors never expose captured stdout stderr or synthetic secret values' {
   $native=(Get-Command Invoke-ProdNative).ScriptBlock

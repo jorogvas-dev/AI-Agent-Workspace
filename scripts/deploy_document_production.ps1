@@ -203,6 +203,23 @@ function Assert-DatabaseConfiguration($WebEnv, $KnowledgeEnv, $ChromaEnv) {
       ($ChromaEnv.ContainsKey('CHROMA_DB_IMPL') -and $ChromaEnv['CHROMA_DB_IMPL'] -notmatch 'sqlite')) { Stop-Prod 'Unsupported Chroma persistence configuration.' }
 }
 
+function Read-StartupSettingJson([string]$Kind, [string]$Id, [string]$ContainerName, [string]$Setting) {
+  try {
+    $raw=Invoke-ProdNative Docker @($Kind,'inspect','--format',("{{json .Config.$Setting}}"),$Id) 'selected startup setting inspection'
+    if ($raw -isnot [string] -or -not $raw.Trim()) { throw 'Missing JSON.' }
+    # Validate the complete JSON value first. A property wrapper then preserves
+    # empty/single-element arrays without returning them through a PS pipeline.
+    $null=ConvertFrom-Json -InputObject $raw -ErrorAction Stop
+    $wrapped=ConvertFrom-Json -InputObject ('{"setting":'+$raw+'}') -ErrorAction Stop
+    $value=$wrapped.setting
+    if ($null -eq $value) { return 'null' }
+    if ($Setting -cin @('Cmd','Entrypoint')) {
+      if ($value -isnot [array]) { throw 'Expected an argument array.' }
+      foreach ($argument in $value) { if ($argument -isnot [string]) { throw 'Expected a string argument.' } }
+    } elseif ($value -isnot [string]) { throw 'Expected a string setting.' }
+    ConvertTo-Json -InputObject $value -Depth 4 -Compress
+  } catch { Stop-Prod "Startup inspection failed for $ContainerName setting $Setting; no mutation allowed; values withheld." }
+}
 function Assert-MainMounts($Ui, $Knowledge, $Chroma, [string]$Root) {
   foreach ($entry in @($Ui,$Knowledge,$Chroma)) {
     $targets=@($entry.Record.Mounts | ForEach-Object { $_.Destination })
@@ -213,9 +230,14 @@ function Assert-MainMounts($Ui, $Knowledge, $Chroma, [string]$Root) {
         $entry.Raw.HostConfig.DeviceRequests) { Stop-Prod 'Unsupported host/device overrides; review instead of silently changing settings.' }
     $names = @($entry.Raw.NetworkSettings.Networks.PSObject.Properties.Name)
     if ($names.Count -ne 2 -or $names -notcontains 'agent-internal' -or $names -notcontains 'bridge') { Stop-Prod 'Canonical network attachments differ from the observed baseline.' }
-    $image = Read-DockerJson @('image','inspect','--format','{{json .}}',$entry.Record.Image)
+    Assert-Id $entry.Record.Id
+    if ($entry.Record.Image -cnotmatch '^sha256:[a-f0-9]{64}$') { Stop-Prod 'Startup inspection requires a pinned full image ID.' }
     foreach ($key in @('Cmd','Entrypoint','WorkingDir','User')) {
-      if ((Get-ObjectHash (Get-Field $entry.Raw.Config $key)) -cne (Get-ObjectHash (Get-Field $image.Config $key))) { Stop-Prod 'Custom startup settings require review before adopting the pinned image.' }
+      $containerJson=Read-StartupSettingJson 'container' $entry.Record.Id $entry.Record.Name $key
+      $imageJson=Read-StartupSettingJson 'image' $entry.Record.Image $entry.Record.Name $key
+      if (-not [string]::Equals($containerJson,$imageJson,[StringComparison]::Ordinal)) {
+        Stop-Prod "Startup mismatch for $($entry.Record.Name) setting $key; review before adopting the pinned image; values withheld."
+      }
     }
   }
   $uiData = @($Ui.Record.Mounts | Where-Object { $_.Destination -ceq '/app/backend/data' })
