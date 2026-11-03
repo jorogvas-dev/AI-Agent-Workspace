@@ -204,6 +204,10 @@ function Assert-DatabaseConfiguration($WebEnv, $KnowledgeEnv, $ChromaEnv) {
 }
 
 function Assert-MainMounts($Ui, $Knowledge, $Chroma, [string]$Root) {
+  foreach ($entry in @($Ui,$Knowledge,$Chroma)) {
+    $targets=@($entry.Record.Mounts | ForEach-Object { $_.Destination })
+    if (@($targets | Select-Object -Unique).Count -ne $targets.Count) { Stop-Prod 'Duplicate mount targets are not approved.' }
+  }
   foreach ($entry in @($Ui,$Knowledge)) {
     if ($entry.Raw.HostConfig.ExtraHosts -or $entry.Raw.HostConfig.Privileged -or $entry.Raw.HostConfig.Devices -or
         $entry.Raw.HostConfig.DeviceRequests) { Stop-Prod 'Unsupported host/device overrides; review instead of silently changing settings.' }
@@ -216,8 +220,14 @@ function Assert-MainMounts($Ui, $Knowledge, $Chroma, [string]$Root) {
   }
   $uiData = @($Ui.Record.Mounts | Where-Object { $_.Destination -ceq '/app/backend/data' })
   if ($uiData.Count -ne 1 -or $uiData[0].Type -ne 'volume' -or $uiData[0].Name -cne 'open-webui' -or -not $uiData[0].RW) { Stop-Prod 'Main WebUI volume identity differs from open-webui.' }
+  foreach ($name in @('output','scripts','temp')) {
+    $mount=@($Ui.Record.Mounts | Where-Object { $_.Destination -ceq "/workspace/$name" })
+    if ($mount.Count -ne 1 -or $mount[0].Type -cne 'bind' -or -not $mount[0].RW -or
+        [IO.Path]::GetFullPath($mount[0].Source) -ine (Join-Path $Root $name)) { Stop-Prod 'Observed WebUI workspace bind source/type/mode differs from the approved layout.' }
+  }
   foreach ($mount in $Ui.Record.Mounts) {
-    if ($mount.Destination -eq '/app/backend/.webui_secret_key' -or ($mount.RW -and $mount.Destination -ne '/app/backend/data')) { Stop-Prod 'Uncovered WebUI writable storage/signing-key file requires a separate reviewed backup plan.' }
+    if ($mount.Destination -eq '/app/backend/.webui_secret_key' -or
+        ($mount.RW -and $mount.Destination -cnotin @('/app/backend/data','/workspace/output','/workspace/scripts','/workspace/temp'))) { Stop-Prod 'Uncovered WebUI writable storage/signing-key file requires a separate reviewed backup plan.' }
   }
   foreach ($pair in @(@('input','/workspace/input'),@('knowledge','/workspace/knowledge'))) {
     $mount = @($Knowledge.Record.Mounts | Where-Object { $_.Destination -ceq $pair[1] })
@@ -241,7 +251,10 @@ function Convert-ProdMount($Mount, $State, [string[]]$Tracked) {
     $prefix = $State.Root.TrimEnd('\') + '\'
     if ($source.StartsWith($prefix,[StringComparison]::OrdinalIgnoreCase)) {
       $relative = $source.Substring($prefix.Length).Replace('\','/')
-      if ($Tracked -ccontains $relative -or @($Tracked | Where-Object { $_.StartsWith($relative + '/', [StringComparison]::Ordinal) }).Count) {
+      # Operational output/temp binds retain their exact source and mode even
+      # when a tracked placeholder happens to exist below them. Never restore them.
+      $operational=$relative -cin @('output','temp') -and $Mount.Destination -ceq "/workspace/$relative"
+      if (-not $operational -and ($Tracked -ccontains $relative -or @($Tracked | Where-Object { $_.StartsWith($relative + '/', [StringComparison]::Ordinal) }).Count)) {
         $source = Join-Path $State.Release $relative; $result.read_only=$true
       } elseif ($relative -match '^(scripts|tools)(/|$)') { Stop-Prod 'Untracked source bind cannot enter a production release.' }
     }
@@ -310,6 +323,11 @@ function Invoke-Helper($State, [string[]]$Mounts, [string]$Code) {
   foreach ($mount in $Mounts) { $args+=@('--mount',$mount) }
   $args+=@($images.helper,'-s')
   Invoke-ProdNative Docker $args 'isolated cached backup helper' -InputText ("set -eu`n" + $Code)
+}
+function Assert-HelperCapabilities($State) {
+  # All external commands used by archive creation, validation AND restoration.
+  try { $null=Invoke-Helper $State @() 'for tool in tar find sha256sum sort cmp rm; do command -v "$tool" >/dev/null || exit 1; done' }
+  catch { Stop-Prod 'Cached helper must provide sh, tar, find, sha256sum, sort, cmp and rm before quiescing production; restore the reviewed helper capabilities offline.' }
 }
 function Get-DataMount($State, [ValidateSet('webui','chroma')][string]$Target, [switch]$Writable) {
   $null=Assert-Storage $State
@@ -476,7 +494,7 @@ finally:
 }
 function Get-KnowledgeBaseline([string]$Id, [switch]$Planner) {
   $code=@'
-import hashlib,json,os,urllib.request
+import hashlib,json,os,urllib.request,urllib.error
 from pathlib import Path
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self,*args): raise RuntimeError('redirect refused')
@@ -486,17 +504,72 @@ token=Path('/run/secrets/agent_knowledge_token').read_text().strip() if planner 
 base='http://knowledge-service:8002' if planner else 'http://127.0.0.1:8002'
 def get(path,auth=False):
     req=urllib.request.Request(base+path,headers={'Authorization':'Bearer '+token} if auth else {})
-    with opener.open(req,timeout=15) as r: raw=r.read(65537); assert len(raw)<=65536
+    with opener.open(req,timeout=15) as r:
+        assert r.status==200
+        raw=r.read(65537); assert len(raw)<=65536
     return json.loads(raw)
-health=get('/health'); assert health['status']=='ok' and health['chunks']>0 and health['indexed_files']>0
-ids=[]; offset=0
-while True:
-    page=get('/documents?limit=50&offset='+str(offset),True)
-    assert page['status']=='success' and page['result_count']==len(page['documents'])
-    ids.extend(x['document_id'] for x in page['documents'])
-    if not page['pagination']['has_more']: break
-    offset=page['pagination']['next_offset']; assert type(offset) is int and offset<=10000
-assert len(ids)>0 and len(ids)==len(set(ids))
+MAX_INVENTORY=10000; PAGE=50
+def count(value):
+    assert type(value) is int and 0<value<=MAX_INVENTORY
+    return value
+def identity(document_id,root,source):
+    assert type(root) is str and root in ('input','knowledge')
+    assert type(source) is str and source and source==source.strip() and len(source.encode('utf-8'))<=512
+    assert '\\' not in source and ':' not in source
+    assert not any(ord(c)<32 or 127<=ord(c)<=159 for c in source)
+    assert not any(part in ('','.','..') for part in source.split('/'))
+    assert type(document_id) is str and document_id==hashlib.sha256((root+':'+source).encode()).hexdigest()
+    return document_id
+def catalog(first):
+    ids=[]; offset=0; total=None; page=first
+    while True:
+        assert type(page) is dict and page['status']=='success' and type(page['documents']) is list
+        rows=page['documents']; p=page['pagination']
+        assert type(p) is dict and set(p)=={'limit','offset','total','has_more','next_offset'}
+        current=count(p['total'])
+        if total is None: total=current
+        assert current==total and type(p['limit']) is int and p['limit']==PAGE
+        assert type(p['offset']) is int and p['offset']==offset
+        assert type(page['result_count']) is int and page['result_count']==len(rows)==min(PAGE,total-offset)
+        for row in rows:
+            assert type(row) is dict and set(row)=={'document_id','folder','source'}
+            ids.append(identity(row['document_id'],row['folder'],row['source']))
+        offset+=len(rows); more=offset<total
+        assert type(p['has_more']) is bool and p['has_more']==more
+        assert (type(p['next_offset']) is int and p['next_offset']==offset) if more else p['next_offset'] is None
+        if not more: return ids
+        page=get('/documents?limit=50&offset='+str(offset),True)
+def legacy_inventory():
+    # Existing collection only. No server import, create, migration or record writes.
+    assert os.environ['CHROMA_HOST']=='chromadb' and os.environ['CHROMA_PORT']=='8000'
+    import chromadb
+    from chromadb.config import Settings
+    client=chromadb.HttpClient(host='chromadb',port=8000,settings=Settings(anonymized_telemetry=False))
+    collection=client.get_collection(name='agent_file_state')
+    total=count(collection.count()); ids=[]
+    for offset in range(0,total,PAGE):
+        assert count(collection.count())==total
+        page=collection.get(limit=PAGE,offset=offset,include=['metadatas'])
+        assert type(page) is dict and len(json.dumps(page).encode())<=65536
+        keys=page['ids']; metadata=page['metadatas']
+        assert type(keys) is list and type(metadata) is list and len(keys)==len(metadata)==min(PAGE,total-offset)
+        for key,record in zip(keys,metadata):
+            assert type(record) is dict
+            ids.append(identity(key,record['root'],record['source']))
+    assert count(collection.count())==total
+    return ids
+health=get('/health'); assert health['status']=='ok'
+assert type(health['chunks']) is int and health['chunks']>0
+count(health['indexed_files'])
+# Only an original's FIRST authenticated catalog request may enable legacy mode.
+# Authentication, transport/JSON errors and failures on later pages always abort.
+try: first=get('/documents?limit=50&offset=0',True)
+except urllib.error.HTTPError as error:
+    if planner or error.code!=404: raise
+    error.close()
+    ids=legacy_inventory()
+else: ids=catalog(first)
+assert len(ids)==health['indexed_files'] and len(ids)==len(set(ids)) and len(ids)>0
 print(json.dumps(dict(chunks=health['chunks'],files=health['indexed_files'],documents=len(ids),identities=hashlib.sha256('\n'.join(sorted(ids)).encode()).hexdigest())))
 '@
   Invoke-ContainerProbe $Id ($code.Replace('PLANNER_FLAG',$(if($Planner){'True'}else{'False'})))
@@ -655,7 +728,8 @@ import tools.analyze_document_production as tool
 assert service.pipeline.VERSION=='0.6i' and service.PROFILE=='production'
 assert [x for x in vars(tool.Tools) if not x.startswith('_')]==['analyze_document']
 '@}else{@'
-import runpy
+import os,runpy
+os.environ['KNOWLEDGE_TOKEN']='synthetic-import-validation-only'
 runpy.run_path('/release/knowledge-service/server.py',run_name='release_import_validation')
 '@}
     $null=Invoke-ProdNative Docker @('run','--rm','-i','--pull','never','--network','none','--read-only','--cap-drop','ALL',
@@ -767,7 +841,7 @@ function Invoke-ProdPrepare([string]$Commit) {
     if($tag -and $tag -cne $images[$role]){Stop-Prod 'Existing local image alias points elsewhere; refusing to retag.'}
     if(-not $tag){$null=Invoke-ProdNative Docker @('image','tag',$images[$role],$alias) 'guarded local image alias'}
   }
-  $null=Invoke-Helper $state @() 'command -v tar >/dev/null; command -v find >/dev/null; command -v sha256sum >/dev/null; command -v sort >/dev/null'
+  Assert-HelperCapabilities $state
   foreach($target in @('webui','chroma')){
     $mount=Get-DataMount $state $target
     $required=if($target -eq 'webui'){'webui.db'}else{'chroma.sqlite3'}
@@ -813,6 +887,7 @@ function Invoke-ProdCutover($State) {
   if($State.Phase -cne 'Prepared'){Stop-Prod 'Cutover requires Prepared state. For a partial failure use the recorded Rollback, not blind retries.'}
   Assert-Release $State;$null=Assert-Storage $State;Assert-NoUnknownWriters $State
   foreach($name in $State.Originals.PSObject.Properties.Name){$current=Assert-Original $State $name;if($current.Record.Name -cne $name){Stop-Prod 'An original moved after Prepare.'}}
+  Assert-HelperCapabilities $State
   Set-ProdPhase $State 'Quiescing'
   # Stop all shared-volume/historical knowledge writers before canonical services.
   foreach($name in @('open-webui-before-scripts','open-webui-backup','knowledge-service-v1-backup','open-webui','knowledge-service','chromadb')){Stop-Original $State $name}
@@ -878,6 +953,7 @@ cmp /out/restored.files /archive/MANIFEST
   $null=Invoke-Helper $State @($mount,"type=bind,source=$($State.Directory),target=/archive,readonly","type=bind,source=$($State.Directory),target=/out") ($code.Replace('ARCHIVE',$leaf).Replace('MANIFEST',$manifest))
 }
 function Invoke-ProdRollback($State,[switch]$RestoreData) {
+  if($RestoreData){Assert-HelperCapabilities $State}
   Set-ProdPhase $State 'RollbackStopping'
   foreach($name in @('open-webui-before-scripts','open-webui-backup','knowledge-service-v1-backup')){Stop-Original $State $name}
   Stop-ProdReplacements $State

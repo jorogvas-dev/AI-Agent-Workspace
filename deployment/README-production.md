@@ -23,6 +23,10 @@ override; there is no potentially broader default binding in the Compose file.
 
 Before any operator action, freeze production UI writes, uploads, indexing input
 changes, concurrent Docker/Compose/Git operations, and other database clients.
+The freeze also covers tools, jobs and operators using the WebUI workspace
+`output/`, `scripts/` and `temp/` binds; do not run them during preparation,
+cutover, acceptance or rollback. Output/temp stay in place and are not part of
+database backup/restoration; neither action clears or restores those directories.
 Export/verify current UI models and tools locally without printing secret valves.
 Record representative chats and documents for acceptance. Keep existing model,
 tool, and preset configurations; the procedure never imports/replaces them.
@@ -64,9 +68,23 @@ credential paths are fixed by the reviewed application.
 
 Prepare refuses external/custom WebUI SQL or vector stores and uncovered writable
 mounts: its backup plan covers local `webui.db` and `/data/chroma.sqlite3` only.
+The observed WebUI layout must include the `open-webui` volume at
+`/app/backend/data` and these exact initially writable binds:
+
+| Original host source | Container target | Replacement |
+| --- | --- | --- |
+| `E:\AI-Agent-Workspace\output` | `/workspace/output` | Same source, writable |
+| `E:\AI-Agent-Workspace\scripts` | `/workspace/scripts` | Exported release `scripts/`, read-only |
+| `E:\AI-Agent-Workspace\temp` | `/workspace/temp` | Same source, writable |
+
+Changed sources/modes, duplicate targets and unexpected writable mounts abort.
+The scripts bind uses the tracked, commit-pinned release; rollback restores the
+verified original container with its original bind, without copying source files.
 The observed production knowledge host/port/model/watcher settings must match;
 document binds must still be root `input/` and `knowledge/`. Cached helper `sh`,
-`tar`, `find`, `sha256sum`, and `sort` must work offline. The conservative archive
+`tar`, `find`, `sha256sum`, `sort`, `cmp` and `rm` must work offline. Prepare and
+Cutover check all of them before quiescing; data rollback checks again before
+stopping writers. The conservative archive
 policy supports regular files/directories, including dotfiles; **links, hardlinks,
 special entries, duplicate paths, and traversal names are refused**. If cache or
 data contains links, obtain a separately reviewed backup implementation; do not
@@ -92,10 +110,29 @@ Prepare does not stop originals or start production services. It exports private
 configuration, guards/tags cached images, exports a unique commit-pinned release
 under `runtime/production/releases/<commit>/<run-id>`, and validates imports in
 cached containers with **no network or credential mounts**. It checks SQLite and
-catalog baselines and uses **synthetic env files only** for `compose config
+catalog baselines. The isolated knowledge import process sets
+`KNOWLEDGE_TOKEN=synthetic-import-validation-only` solely to satisfy the server's
+import-time requirement. This is **synthetic import validation, not credential
+validation**; the separate original environment/file comparison and authenticated
+catalog/readiness probes validate actual credentials during operator execution.
+Prepare uses **synthetic env files only** for `compose config
 --quiet`. The actual deployment uses its frozen template/private override, an
 explicit empty `--env-file`, and restored process interpolation variables. Do not
 run the base Compose file alone or the old definitions against renamed backups.
+
+Original-baseline capture uses the authenticated `/documents` catalog when
+available. Only a confirmed **404 on the original's first authenticated catalog
+request** permits reading the existing Chroma `agent_file_state` collection with
+`get_collection`, `count` and paginated metadata `get` calls. It never creates a
+collection, indexes, migrates or writes records. Both inventory paths validate
+root/source identities, their SHA-256 IDs, unique entries, consistent counts and
+pagination; inventories must contain 1–10,000 files in pages of at most 50, with
+bounded source paths/pages. Health's positive indexed-file count must match the
+inventory. Only chunk/file/document counts and the sorted identity digest are
+returned for the private baseline. Authentication/transport errors, redirects,
+malformed data or later-page errors abort without fallback; no empty baseline is
+substituted. The replacement must provide its authenticated catalog, matching
+that digest/count and retaining non-reset positive chunk/file counts.
 
 Cutover rechecks IDs/configuration, disables restart and stops all historical
 duplicates, then stops canonical UI/knowledge and the same Chroma. Only when all
@@ -191,4 +228,8 @@ in incident recovery.
 The tests use synthetic metadata and mocked Docker/Git commands. They do not read
 real credentials, operate production/test containers, run application tests, or
 prove that the live prerequisites or acceptance cases pass. Synthetic scratch
-files are retained in the Windows temporary directory for inspection.
+files are retained in the Windows temporary directory for inspection. Embedded
+import/catalog probes execute in a standard-library harness with HTTP, Chroma
+and `runpy` fakes and networking blocked. The default interpreter is the existing workspace
+`.venv/Scripts/python.exe`; pass `-PythonExecutable '<existing-python-path>'` to
+select another installed interpreter. No dependency installation is performed.

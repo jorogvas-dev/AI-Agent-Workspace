@@ -1,6 +1,7 @@
 # All orchestration tests mock Docker/Git. Optional validation runs only Compose
 # config against synthetic env files, never production environments or containers.
-[CmdletBinding()]param([switch]$ValidateCompose)
+[CmdletBinding()]param([switch]$ValidateCompose,
+  [string]$PythonExecutable=(Join-Path (Split-Path $PSScriptRoot -Parent) '.venv/Scripts/python.exe'))
 $ErrorActionPreference='Stop'
 $helper=Join-Path $PSScriptRoot 'deploy_document_production.ps1'
 $tokens=$null;$parseErrors=$null
@@ -31,6 +32,119 @@ function Test-Case([string]$Name,[scriptblock]$Body){& $Body | Out-Null;$script:
 $scratch=Join-Path ([IO.Path]::GetTempPath()) ('production-deploy-synthetic-'+[guid]::NewGuid().ToString('N'))
 $null=New-Item -ItemType Directory -Path $scratch
 # Synthetic scratch files are deliberately retained; there is no cleanup action.
+
+# Execute only embedded deployment probes, with fake HTTP/Chroma/runpy objects.
+# No application modules, credential files, Docker, Git or network are accessed.
+$pythonHarness=Join-Path $scratch 'synthetic-probes.py'
+[IO.File]::WriteAllText($pythonHarness,@'
+import contextlib,hashlib,io,json,os,runpy,socket,sys,types,urllib.error,urllib.parse,urllib.request
+from pathlib import Path
+from unittest.mock import patch
+case=json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
+os.environ.clear()
+os.environ.update(KNOWLEDGE_TOKEN='synthetic-offline-token',CHROMA_HOST='chromadb',CHROMA_PORT='8000')
+calls=[]; output=io.StringIO(); result=None; ok=False; error=None
+fault=case.get('fault'); size=case.get('size',53); mode=case.get('mode','catalog')
+docs=[]
+for n in range(size):
+    root='input' if n%2 else 'knowledge'; source='folder/file-'+str(n)+'.txt'
+    docs.append(dict(folder=root,source=source,document_id=hashlib.sha256((root+':'+source).encode()).hexdigest()))
+if fault=='root': docs[0]['folder']='other'
+if fault=='source': docs[0]['source']='../escape.txt'
+if fault=='source-backslash': docs[0]['source']='folder\\file.txt'
+if fault=='source-control': docs[0]['source']='file\x00.txt'.encode().decode('unicode_escape')
+if fault=='source-long': docs[0]['source']='x'*513
+if fault=='id': docs[0]['document_id']='f'*64
+if fault=='duplicate': docs[-1]=docs[0].copy()
+class Response(io.BytesIO):
+    status=200
+class Opener:
+    def open(self,request,timeout):
+        assert timeout==15
+        url=request.full_url; calls.append('http:'+url)
+        base='http://knowledge-service:8002' if case.get('planner') else 'http://127.0.0.1:8002'
+        assert url.startswith(base+'/')
+        if url==base+'/health':
+            data=dict(status='ok',chunks=200,indexed_files=size)
+        else:
+            assert request.get_header('Authorization')=='Bearer synthetic-offline-token'
+            offset=int(urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)['offset'][0])
+            if mode in ('legacy','auth','forbidden','server-error') or (mode=='later-404' and offset):
+                code={'legacy':404,'auth':401,'forbidden':403,'server-error':500,'later-404':404}[mode]
+                raise urllib.error.HTTPError(url,code,'synthetic',{},io.BytesIO(b''))
+            if mode=='timeout': raise TimeoutError('synthetic')
+            if mode=='malformed': return Response(b'{')
+            if mode=='oversized': return Response(b'x'*65537)
+            if mode=='redirect': raise RuntimeError('redirect refused')
+            rows=docs[offset:offset+50]; end=offset+len(rows); total=size
+            if fault=='total-drift' and offset: total+=1
+            p=dict(limit=50,offset=offset,total=total,has_more=end<total,next_offset=end if end<total else None)
+            if fault=='offset': p['offset']=offset+1
+            if fault=='boolean': p['has_more']=1
+            if fault=='next-offset': p['next_offset']=offset
+            if fault=='result-count': rows=rows[:-1]
+            data=dict(status='success',documents=rows,result_count=len(rows),pagination=p)
+        return Response(json.dumps(data).encode())
+def build_opener(handler):
+    try: handler.redirect_request(None,None,None,None,None,None)
+    except RuntimeError: pass
+    else: raise AssertionError('redirects must be rejected')
+    return Opener()
+class Collection:
+    counts=0
+    def count(self):
+        calls.append('chroma:count'); self.counts+=1
+        return size+1 if fault=='count-drift' and self.counts>1 else size
+    def get(self,*,limit,offset,include):
+        calls.append('chroma:get:'+str(offset))
+        assert limit==50 and include==['metadatas']
+        rows=docs[offset:offset+limit]
+        data=dict(ids=[x['document_id'] for x in rows],metadatas=[dict(root=x['folder'],source=x['source']) for x in rows])
+        if fault=='short-page': data['ids']=data['ids'][:-1]; data['metadatas']=data['metadatas'][:-1]
+        if fault=='metadata-length': data['metadatas']=[]
+        if fault=='metadata-oversized': data['metadatas'][0]['extra']='x'*65537
+        return data
+    def __getattr__(self,name):
+        calls.append('forbidden:'+name); raise AssertionError('only count/get allowed')
+class Client:
+    def get_collection(self,*,name):
+        calls.append('chroma:get_collection:'+name); assert name=='agent_file_state'
+        return Collection()
+    def __getattr__(self,name):
+        calls.append('forbidden:'+name); raise AssertionError('only get_collection allowed')
+def client(*,host,port,settings):
+    calls.append('chroma:client'); assert host=='chromadb' and port==8000 and settings=={'anonymized_telemetry':False}
+    return Client()
+fake=types.ModuleType('chromadb'); fake.HttpClient=client
+config=types.ModuleType('chromadb.config'); config.Settings=lambda **kw: kw
+def synthetic_token(path,*args,**kwargs):
+    assert path.as_posix()=='/run/secrets/agent_knowledge_token'
+    calls.append('synthetic-token'); return 'synthetic-offline-token'
+def import_check(path,*,run_name):
+    assert path=='/release/knowledge-service/server.py' and run_name=='release_import_validation'
+    # Model the real server's import-time requirement without importing the app.
+    assert os.environ['KNOWLEDGE_TOKEN']=='synthetic-import-validation-only'
+    calls.append('synthetic-import-with-token')
+def forbidden_network(*args,**kwargs): raise AssertionError('network forbidden')
+try:
+    with patch.dict(sys.modules,{'chromadb':fake,'chromadb.config':config}), patch('urllib.request.build_opener',build_opener), patch.object(Path,'read_text',synthetic_token), patch.object(runpy,'run_path',import_check), patch.object(socket,'socket',forbidden_network), contextlib.redirect_stdout(output):
+        exec(compile(case['code'],'<deployment-probe>','exec'),{})
+    if output.getvalue(): result=json.loads(output.getvalue())
+    ok=True
+except Exception as exc: error=type(exc).__name__
+print(json.dumps(dict(ok=ok,error=error,result=result,calls=calls)))
+'@,[Text.UTF8Encoding]::new($false))
+function Invoke-SyntheticProbe([string]$Code,[string]$Mode='catalog',[string]$Fault='',[int]$Size=53,[switch]$Planner) {
+  if(-not (Test-Path -LiteralPath $PythonExecutable -PathType Leaf)){throw 'TEST: supply -PythonExecutable for the offline standard-library probe harness.'}
+  $fixture=Join-Path $scratch ('probe-'+[guid]::NewGuid().ToString('N')+'.json')
+  [IO.File]::WriteAllText($fixture,(ConvertTo-Json @{code=$Code;mode=$Mode;fault=$Fault;size=$Size;planner=[bool]$Planner}),[Text.UTF8Encoding]::new($false))
+  $raw=@(& $PythonExecutable -I -B $pythonHarness $fixture 2>&1)
+  if($LASTEXITCODE -ne 0){throw 'TEST: synthetic probe harness failed; native output withheld.'}
+  ConvertFrom-Json ($raw -join "`n")
+}
+function Get-SyntheticBaselineCode([switch]$Planner) {
+  With-Mocks @{'Invoke-ContainerProbe'={param($Id,$Code) $Code}} { Get-KnowledgeBaseline ('1'*64) -Planner:$Planner }
+}
 
 function New-TestState {
   $script:events=[Collections.Generic.List[string]]::new();$script:containers=@{}
@@ -255,7 +369,7 @@ Test-Case 'captured port bindings preserve loopback IPv4 and IPv6 without broade
   $ports=@(Get-ProdPorts $ui);Assert-Test ($ports.Count -eq 2) 'all bindings retained'
   Assert-Test (@($ports | Where-Object {$_.host_ip -in @('127.0.0.1','::1')}).Count -eq 2) 'no all-host default inserted'
 }
-Test-Case 'observed null extra-host device and port metadata passes main mount validation' {
+Test-Case 'actual production mounts pass while unknown changed duplicate and wrong-mode mounts fail' {
   $s=New-TestState;$script:startup=[pscustomobject]@{Cmd=@('run');Entrypoint=$null;WorkingDir='/app';User=''}
   $entries=@()
   foreach($name in @('open-webui','knowledge-service','chromadb')){
@@ -265,12 +379,33 @@ Test-Case 'observed null extra-host device and port metadata passes main mount v
     $entry.Raw.NetworkSettings.Networks=[pscustomobject]@{'agent-internal'=[pscustomobject]@{};bridge=[pscustomobject]@{}}
     $entries+=$entry
   }
-  $entries[0].Record.Mounts=@([pscustomobject]@{Type='volume';Name='open-webui';Destination='/app/backend/data';RW=$true})
+  $entries[0].Record.Mounts=@([pscustomobject]@{Type='volume';Name='open-webui';Destination='/app/backend/data';RW=$true})+@(
+    foreach($name in @('output','scripts','temp')){[pscustomobject]@{Type='bind';Source="E:\AI-Agent-Workspace\$name";Destination="/workspace/$name";RW=$true}})
   $entries[1].Record.Mounts=@([pscustomobject]@{Type='bind';Source='E:\AI-Agent-Workspace\input';Destination='/workspace/input';RW=$true},
     [pscustomobject]@{Type='bind';Source='E:\AI-Agent-Workspace\knowledge';Destination='/workspace/knowledge';RW=$true})
   $entries[2].Record.Mounts=@([pscustomobject]@{Type='bind';Source='E:\AI-Agent-Workspace\knowledge-db';Destination='/data';RW=$true})
   With-Mocks @{'Read-DockerJson'={param($Arguments) [pscustomobject]@{Config=$script:startup}};'Assert-NoReparse'={param($Path,[switch]$Tree)}} {
     Assert-MainMounts $entries[0] $entries[1] $entries[2] 'E:\AI-Agent-Workspace'
+    $original=$entries[0].Record.Mounts
+    foreach($bad in @([pscustomobject]@{Type='bind';Source='E:\AI-Agent-Workspace\other';Destination='/other';RW=$true},$original[1])){
+      $entries[0].Record.Mounts=$original+@($bad)
+      $null=Expect-Failure {Assert-MainMounts $entries[0] $entries[1] $entries[2] $s.Root} 'Uncovered|Duplicate'
+    }
+    $entries[0].Record.Mounts=$original
+    foreach($index in @(1,2,3)){
+      $source=$original[$index].Source;$original[$index].Source='E:\AI-Agent-Workspace\changed'
+      $null=Expect-Failure {Assert-MainMounts $entries[0] $entries[1] $entries[2] $s.Root} 'bind source/type/mode'
+      $original[$index].Source=$source;$original[$index].RW=$false
+      $null=Expect-Failure {Assert-MainMounts $entries[0] $entries[1] $entries[2] $s.Root} 'bind source/type/mode'
+      $original[$index].RW=$true
+    }
+    $tracked=@('scripts/document_service_production.py','output/.gitkeep','temp/.gitkeep')
+    foreach($mount in $original | Select-Object -Skip 1){
+      $mapped=Convert-ProdMount $mount $s $tracked
+      if($mount.Destination -ceq '/workspace/scripts'){
+        Assert-Test ($mapped.source -ieq (Join-Path $s.Release 'scripts') -and $mapped.read_only) 'scripts use immutable release read-only'
+      }else{Assert-Test ($mapped.source -ceq $mount.Source -and -not $mapped.read_only) 'output/temp remain exact writable binds even with tracked placeholders'}
+    }
     $entries[1].Raw.HostConfig.PortBindings=[pscustomobject]@{'8002/tcp'=@([pscustomobject]@{HostPort='8002'})}
     $null=Expect-Failure {Assert-MainMounts $entries[0] $entries[1] $entries[2] 'E:\AI-Agent-Workspace'} 'published ports'
   }
@@ -343,6 +478,79 @@ Test-Case 'Git export sends binary archive to output file and retains all tracke
     Export-ProdRelease $s $script:tracked
     Assert-Test (@(Get-ChildItem $s.Release -Recurse -File).Count -eq $script:tracked.Count) 'all tracked dependencies exported'
     Assert-Test ($script:exportCalls.Count -eq 3) 'only mocked archive and two credential-free import checks'
+    $payload=$script:exportCalls[2].Input
+    $check=Invoke-SyntheticProbe $payload
+    Assert-Test ($check.ok -and $check.calls -contains 'synthetic-import-with-token') 'knowledge import sets its own synthetic required environment'
+    $withoutToken=$payload.Replace("os.environ['KNOWLEDGE_TOKEN']='synthetic-import-validation-only'",'')
+    $check=Invoke-SyntheticProbe $withoutToken
+    Assert-Test (-not $check.ok) 'import harness rejects missing synthetic environment setup'
+  }
+}
+Test-Case 'catalog and original-only legacy 404 produce the same bounded identity digest' {
+  $code=Get-SyntheticBaselineCode
+  $catalog=Invoke-SyntheticProbe $code
+  $legacy=Invoke-SyntheticProbe $code -Mode legacy
+  Assert-Test ($catalog.ok -and $legacy.ok) 'both original baseline paths validate actual probe code'
+  Assert-Test ((Get-ObjectHash $catalog.result) -ceq (Get-ObjectHash $legacy.result)) 'catalog and metadata identities match'
+  Assert-Test ($legacy.result.documents -eq 53 -and $legacy.result.chunks -eq 200 -and $legacy.result.files -eq 53) 'nonempty file/chunk counts retained'
+  $ids=@(0..52 | ForEach-Object {$folder=if($_%2){'input'}else{'knowledge'};Get-TextHash ($folder+':folder/file-'+$_+'.txt')})
+  $digest=Get-TextHash ((@($ids | Sort-Object -CaseSensitive)) -join "`n")
+  Assert-Test ($legacy.result.identities -ceq $digest) 'digest contains validated source identities only'
+  Assert-Test (@($legacy.result.PSObject.Properties).Count -eq 4) 'only counts and identity digest returned'
+  Assert-Test (@($catalog.calls | Where-Object {$_ -like 'chroma:*'}).Count -eq 0) 'catalog-present never touches Chroma'
+  Assert-Test ($legacy.calls -contains 'chroma:get_collection:agent_file_state' -and $legacy.calls -contains 'chroma:get:50') 'existing collection paginated read-only'
+  Assert-Test (@($legacy.calls | Where-Object {$_ -like 'forbidden:*'}).Count -eq 0) 'no create/index/migrate/write methods used'
+  $planner=Invoke-SyntheticProbe (Get-SyntheticBaselineCode -Planner) -Planner
+  Assert-Test ($planner.ok -and $planner.calls -contains 'synthetic-token') 'replacement uses authenticated catalog'
+  $refused=Invoke-SyntheticProbe (Get-SyntheticBaselineCode -Planner) -Mode legacy -Planner
+  Assert-Test (-not $refused.ok -and @($refused.calls | Where-Object {$_ -like 'chroma:*'}).Count -eq 0) 'replacement 404 never falls back'
+}
+Test-Case 'authentication transport malformed oversized and later-page errors never enable legacy fallback' {
+  $code=Get-SyntheticBaselineCode
+  foreach($mode in @('auth','forbidden','server-error','timeout','malformed','oversized','redirect','later-404')){
+    $check=Invoke-SyntheticProbe $code -Mode $mode
+    Assert-Test (-not $check.ok) "baseline aborts on $mode"
+    Assert-Test (@($check.calls | Where-Object {$_ -like 'chroma:*'}).Count -eq 0) "no fallback on $mode"
+  }
+}
+Test-Case 'catalog and Chroma reject invalid identities empty inventories and count or pagination inconsistencies' {
+  $code=Get-SyntheticBaselineCode
+  foreach($mode in @('catalog','legacy')){
+    foreach($fault in @('root','source','source-backslash','source-control','source-long','id','duplicate')){
+      $check=Invoke-SyntheticProbe $code -Mode $mode -Fault $fault
+      Assert-Test (-not $check.ok) "$mode rejects $fault"
+    }
+    foreach($size in @(0,10001)){
+      $check=Invoke-SyntheticProbe $code -Mode $mode -Size $size
+      Assert-Test (-not $check.ok) "$mode rejects empty/oversized inventory"
+    }
+  }
+  foreach($fault in @('total-drift','offset','boolean','next-offset','result-count')){
+    $check=Invoke-SyntheticProbe $code -Fault $fault
+    Assert-Test (-not $check.ok -and @($check.calls | Where-Object {$_ -like 'chroma:*'}).Count -eq 0) "malformed catalog $fault aborts without fallback"
+  }
+  foreach($fault in @('count-drift','short-page','metadata-length','metadata-oversized')){
+    $check=Invoke-SyntheticProbe $code -Mode legacy -Fault $fault
+    Assert-Test (-not $check.ok) "legacy rejects $fault"
+  }
+}
+Test-Case 'every missing backup or restore command aborts before quiescing production' {
+  foreach($missing in @('tar','find','sha256sum','sort','cmp','rm')){
+    $s=New-TestState;$script:missingCommand=$missing
+    With-Mocks $script:orchestration {
+      With-Mocks @{'Invoke-Helper'={param($State,$Mounts,$Code)
+        Assert-Test ($Mounts.Count -eq 0) 'capability check has no data mounts'
+        $match=[regex]::Match($Code,'for tool in ([a-z0-9 ]+); do command -v "\$tool" >/dev/null \|\| exit 1; done')
+        Assert-Test $match.Success 'probe checks each command and fails on the first missing command'
+        $commands=$match.Groups[1].Value.Split(' ')
+        if($commands -contains $script:missingCommand){throw 'synthetic missing helper command'}
+      }} {
+        $null=Expect-Failure {Invoke-ProdCutover $s} 'helper must provide.*cmp and rm'
+        Assert-Test ($s.Phase -ceq 'Prepared' -and @($script:events | Where-Object {$_ -match 'stop:|update:|Quiescing|backup:'}).Count -eq 0) 'all writers untouched on missing command'
+        $null=Expect-Failure {Invoke-ProdRollback $s -RestoreData} 'helper must provide'
+        Assert-Test ($s.Phase -ceq 'Prepared') 'data rollback also checks capabilities before stopping'
+      }
+    }
   }
 }
 Test-Case 'expected-HEAD and tracked-cleanliness failures precede any container mutation' {
