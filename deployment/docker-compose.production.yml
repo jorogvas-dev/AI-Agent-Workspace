@@ -1,0 +1,101 @@
+# Use only through deploy_document_production.ps1 with its recorded private override.
+name: agent-production
+services:
+  open-webui:
+    image: local-agent-production/webui:v06j
+    pull_policy: never
+    container_name: open-webui
+    restart: "no"
+    env_file:
+      - path: ${PROD_STATE_DIR:?Prepare is required}/webui.env
+        format: raw
+        required: true
+    # Exact existing port-3000 host bindings and existing mounts come from the
+    # private override. No default host IP may broaden the original exposure.
+    volumes:
+      - type: volume
+        source: open-webui
+        target: /app/backend/data
+      - type: bind
+        source: ${PROD_RELEASE_DIR:?Prepare is required}/tools/analyze_document_production.py
+        target: /workspace/tools/analyze_document_production.py
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${PROD_STATE_DIR:?Prepare is required}/document_planner_prod_token
+        target: /run/secrets/document_planner_prod_token
+        read_only: true
+        bind: {create_host_path: false}
+    networks: [agent-internal, production-egress]
+
+  knowledge-service:
+    image: local-agent-production/knowledge:v06j
+    pull_policy: never
+    container_name: knowledge-service
+    restart: "no"
+    env_file:
+      - path: ${PROD_STATE_DIR:?Prepare is required}/knowledge.env
+        format: raw
+        required: true
+    volumes:
+      - type: bind
+        source: ${PROD_RELEASE_DIR:?Prepare is required}/knowledge-service/server.py
+        target: /app/server.py
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${PROD_WORKSPACE_DIR:?Prepare is required}/input
+        target: /workspace/input
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${PROD_WORKSPACE_DIR:?Prepare is required}/knowledge
+        target: /workspace/knowledge
+        bind: {create_host_path: false}
+    networks: [agent-internal, production-egress]
+
+  document-planner-prod:
+    image: local-agent-production/planner:v06j
+    pull_policy: never
+    container_name: document-planner-prod
+    restart: "no"
+    working_dir: /workspace
+    command: [python, -B, -m, scripts.document_service_production]
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      LM_STUDIO_ENDPOINT: http://host.docker.internal:1234/v1/chat/completions
+    volumes:
+      - type: bind
+        source: ${PROD_RELEASE_DIR:?Prepare is required}
+        target: /workspace
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${PROD_STATE_DIR:?Prepare is required}/agent_knowledge_token
+        target: /run/secrets/agent_knowledge_token
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${PROD_STATE_DIR:?Prepare is required}/document_planner_prod_token
+        target: /run/secrets/document_planner_prod_token
+        read_only: true
+        bind: {create_host_path: false}
+    read_only: true
+    tmpfs: ["/tmp:size=32m,noexec,nosuid,nodev"]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    mem_limit: 512m
+    cpus: 1.0
+    networks: [agent-internal, production-egress]
+
+volumes:
+  open-webui:
+    external: true
+    name: open-webui
+networks:
+  agent-internal:
+    external: true
+    name: agent-internal
+  production-egress:
+    external: true
+    name: agent-production-egress

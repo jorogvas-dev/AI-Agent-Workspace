@@ -57,3 +57,4 @@ logs/
 
 # Local vector database
 chroma-data/
+/runtime/
