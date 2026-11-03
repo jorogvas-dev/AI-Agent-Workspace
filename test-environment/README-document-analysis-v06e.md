@@ -17,7 +17,8 @@ From `E:\AI-Agent-Workspace`, verify Docker Desktop is healthy, then:
 - Verify existing networks `agent-internal` and `planner-egress-test` with
   `docker network inspect <name>`, and volume `open-webui-test-data` with
   `docker volume inspect open-webui-test-data`. Do not create replacements.
-- Inspect only `.NetworkSettings.Networks`, `.State`, and `.Image` for the three
+- Inspect only identity, restart policy, Compose labels, `.NetworkSettings.Networks`,
+  `.State`, and `.Image` metadata for the three
   original test containers and `chromadb-test`. Require Chroma on `agent-internal`
   and the running planner on `planner-egress-test`. Do not dump container
   environments. The historical planner Compose file still names built-in
@@ -41,7 +42,18 @@ images must exist, or be restored from a trusted offline Docker image archive.
 This snapshot is not rebuildable from these IDs alone. Do not substitute a
 floating image or use `image@sha256:...` for these local IDs.
 
-Run guarded tagging; any existing alias pointing elsewhere aborts adoption:
+Before **any adoption mutation, including image tagging**, capture all three
+original IDs and exact restart policies. Save the printed, non-secret recovery
+record outside this session as well; do not replace captured policies with
+assumptions from Compose. A confirmed incident involved a renamed backup planner
+restarting with its retained `planner-service` network alias, so WebUI could reach
+either API. Renaming does not remove network aliases or disable restart.
+
+The helpers below inspect selected metadata only. All container mutations use
+verified IDs. Keep this session open and do not run competing stack operations.
+Unsupported policy metadata fails before mutation instead of losing retry counts.
+Run guarded tagging only after capture; an existing image alias pointing elsewhere
+aborts adoption:
 
 ```powershell
 Set-Location 'E:\AI-Agent-Workspace'
@@ -51,6 +63,116 @@ $snapshots = [ordered]@{
   'local-agent-test/planner:v06e'   = 'sha256:880c6d21806d53e0b9b1083684c2493b9c155c762f2d956af62713c8f329318b'
   'local-agent-test/webui:v06e'     = 'sha256:0b399a8ba34558e181d316750455f2a95376a38cd60a61b9c942e138898944bd'
 }
+$services = [ordered]@{
+  'knowledge-service-test' = 'knowledge-service-test'
+  'planner-service-test' = 'planner-service'
+  'open-webui-test' = 'open-webui-test'
+}
+function Read-ContainerJson {
+  param([string]$Reference, [string]$Template)
+  $raw = & docker container inspect --format $Template $Reference 2>$null
+  if ($LASTEXITCODE -ne 0) { throw "Metadata inspection failed for $Reference; stop and inspect before retrying." }
+  try { ConvertFrom-Json -InputObject ($raw -join "`n") -ErrorAction Stop }
+  catch { throw "Invalid selected metadata for $Reference; stop adoption." }
+}
+function Get-ContainerId {
+  param([string]$Reference)
+  $containerId = Read-ContainerJson $Reference '{{json .Id}}'
+  if ($containerId -isnot [string] -or $containerId -cnotmatch '^[a-f0-9]{64}$') { throw 'Invalid container ID.' }
+  return $containerId
+}
+function Find-ContainerId {
+  param([string]$Name)
+  $found = @(& docker container ls --all --quiet --no-trunc --filter "name=^/$Name$")
+  if ($LASTEXITCODE -ne 0 -or $found.Count -gt 1) { throw "Cannot establish whether name $Name is occupied; stop before mutation." }
+  if ($found.Count -eq 0) { return $null }
+  $containerId = Get-ContainerId $found[0]
+  if ((Read-ContainerJson $containerId '{{json .Name}}') -cne "/$Name") { throw "Unexpected owner of name $Name." }
+  return $containerId
+}
+function Get-ComposeLabels {
+  param([string]$ContainerId)
+  $labels = Read-ContainerJson $ContainerId '{{json .Config.Labels}}'
+  if ($null -eq $labels -or $labels -isnot [pscustomobject]) { throw 'Invalid Compose label metadata; refusing mutation.' }
+  return $labels
+}
+function Get-RestartArgument {
+  param($Policy)
+  if ($null -eq $Policy -or $Policy.Name -cnotin @('no', 'always', 'unless-stopped', 'on-failure') -or
+      ($Policy.MaximumRetryCount -isnot [int] -and $Policy.MaximumRetryCount -isnot [long]) -or
+      $Policy.MaximumRetryCount -lt 0) { throw 'Invalid restart policy; capture/review exact metadata before proceeding.' }
+  if ($Policy.Name -cne 'on-failure' -and $Policy.MaximumRetryCount -ne 0) {
+    throw 'Nonzero retry count on a non-on-failure policy cannot be restored exactly; stop adoption.'
+  }
+  if ($Policy.Name -ceq 'on-failure' -and $Policy.MaximumRetryCount -gt 0) {
+    return ('on-failure:' + $Policy.MaximumRetryCount.ToString([Globalization.CultureInfo]::InvariantCulture))
+  }
+  return $Policy.Name  # on-failure with zero means unlimited retries, not a missing value.
+}
+function Assert-Original {
+  param([string]$Name, [string]$CurrentName)
+  $containerId = Get-ContainerId $CurrentName
+  if ($containerId -cne $originalIds[$Name] -or
+      (Read-ContainerJson $containerId '{{json .Name}}') -cne "/$CurrentName" -or
+      (Get-ComposeLabels $containerId).'com.docker.compose.project' -cne $originalProjects[$Name]) {
+    throw "Original identity/project mismatch for $Name at $CurrentName; no mutation permitted."
+  }
+  return $containerId
+}
+function Assert-RestartPolicy {
+  param([string]$ContainerId, $Expected)
+  $actual = Read-ContainerJson $ContainerId '{{json .HostConfig.RestartPolicy}}'
+  $null = Get-RestartArgument $actual
+  if ($actual.Name -cne $Expected.Name -or $actual.MaximumRetryCount -ne $Expected.MaximumRetryCount) {
+    throw "Restart policy verification failed for $ContainerId; inspect Name and MaximumRetryCount."
+  }
+}
+function Set-OriginalRestartPolicy {
+  param([string]$Name, [string]$CurrentName, $Policy)
+  $restartArgument = Get-RestartArgument $Policy
+  $containerId = Assert-Original $Name $CurrentName
+  & docker container update "--restart=$restartArgument" $containerId | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw "Restart update failed for verified original $Name; stop and use the recovery record." }
+  $null = Assert-Original $Name $CurrentName
+  Assert-RestartPolicy $containerId $Policy
+}
+function Assert-Backup {
+  param([string]$Name)
+  $containerId = Assert-Original $Name $backups[$Name]
+  $running = Read-ContainerJson $containerId '{{json .State.Running}}'
+  if ($running -isnot [bool] -or $running) {
+    throw "Backup $($backups[$Name]) ($containerId) is not stopped. Halt acceptance; stop only after verifying this recorded original ID."
+  }
+  Assert-RestartPolicy $containerId $restartDisabled
+}
+$stamp = (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N').Substring(0,8)
+$backups = [ordered]@{}
+$originalIds = @{}
+$originalRestartPolicies = @{}
+$originalProjects = @{}
+$replacementIds = @{}
+$restartDisabled = [pscustomobject]@{ Name = 'no'; MaximumRetryCount = 0 }
+$imageAliases = @('local-agent-test/knowledge:v06e', 'local-agent-test/planner:v06e', 'local-agent-test/webui:v06e')
+$imageIndex = 0
+foreach ($name in $services.Keys) {
+  $containerId = Get-ContainerId $name
+  if ((Read-ContainerJson $containerId '{{json .Name}}') -cne "/$name") { throw 'Original name/ID mismatch.' }
+  $originalIds[$name] = $containerId
+  $policy = Read-ContainerJson $containerId '{{json .HostConfig.RestartPolicy}}'
+  $null = Get-RestartArgument $policy
+  $originalRestartPolicies[$name] = $policy
+  $originalProjects[$name] = (Get-ComposeLabels $containerId).'com.docker.compose.project'
+  if ((Read-ContainerJson $containerId '{{json .Image}}') -cne $snapshots[$imageAliases[$imageIndex]]) {
+    throw "Original $name image differs from the reviewed snapshot; stop adoption."
+  }
+  $imageIndex++
+  $backup = "$name-v06e-backup-$stamp"
+  if ($null -ne (Find-ContainerId $backup)) { throw 'Backup name already exists; never overwrite it.' }
+  $backups[$name] = $backup
+}
+[ordered]@{ OriginalIds = $originalIds; RestartPolicies = $originalRestartPolicies;
+  OriginalProjects = $originalProjects; Backups = $backups } | ConvertTo-Json -Depth 6
+# Save the complete non-secret record before the first mutation below.
 foreach ($entry in $snapshots.GetEnumerator()) {
   $cached = & docker image inspect --format '{{.Id}}' $entry.Value
   if ($LASTEXITCODE -ne 0 -or $cached -ne $entry.Value) { throw 'Required cached image unavailable; restore offline first.' }
@@ -137,37 +259,176 @@ availability or readiness. Never use that synthetic value to start containers.
 
 ## 4. One-time adoption
 
-Proceed only after all gates and UI exports pass. Generate unique backup names,
-record this map and original IDs, and refuse existing backup names. None of the
+Proceed only after all gates, the saved recovery record, and UI exports pass.
+Use the IDs/policies/unique backup names captured in preflight; never recapture
+them after changing policies. Disable restart on **all three verified originals
+before stopping or renaming any of them**. None of the
 commands below operate on Chroma, the knowledge candidate, or production.
 
 ```powershell
-$stamp = (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N').Substring(0,8)
-$backups = [ordered]@{}
-$originalIds = @{}
-foreach ($name in @('knowledge-service-test', 'planner-service-test', 'open-webui-test')) {
-  $originalIds[$name] = & docker container inspect --format '{{.Id}}' $name
-  if ($LASTEXITCODE -ne 0) { throw "Original test container missing: $name" }
-  $backup = "$name-v06e-backup-$stamp"
-  & docker container inspect --format '{{.Name}}' $backup 2>$null | Out-Null
-  if ($LASTEXITCODE -eq 0) { throw 'Backup name already exists; never overwrite it.' }
-  $backups[$name] = $backup
-}
-$backups  # Record these non-secret names before proceeding.
-& docker stop knowledge-service-test planner-service-test open-webui-test
-if ($LASTEXITCODE -ne 0) { throw 'Stop failed; inspect before continuing.' }
 foreach ($name in $backups.Keys) {
-  & docker rename $name $backups[$name]
-  if ($LASTEXITCODE -ne 0) { throw 'Rename failed; restore already-renamed originals before retrying.' }
+  Set-OriginalRestartPolicy $name $name $restartDisabled
 }
+foreach ($name in $backups.Keys) {
+  $containerId = Assert-Original $name $name
+  Assert-RestartPolicy $containerId $restartDisabled
+  & docker container stop $containerId | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw 'Stop failed; inspect verified originals before continuing.' }
+}
+foreach ($name in $backups.Keys) {
+  $containerId = Assert-Original $name $name
+  if ($null -ne (Find-ContainerId $backups[$name])) { throw 'Backup name became occupied; never overwrite it.' }
+  & docker container rename $containerId $backups[$name]
+  if ($LASTEXITCODE -ne 0) { throw 'Rename failed; restore already-renamed originals before retrying.' }
+  Assert-Backup $name
+}
+foreach ($name in $backups.Keys) { Assert-Backup $name }
 Invoke-DocumentCompose -ComposeArgs @('up', '-d', '--no-build', '--pull', 'never')
 ```
 
 No builds or pulls are permitted. Do not run the old Compose definitions against
 the renamed backups. Preserve backups until acceptance; this runbook does not
 delete them. Only the test WebUI publishes a port: `127.0.0.1:3001:8080`.
+If any step fails, halt acceptance and use the guarded rollback below, including
+for a partially completed stop/rename phase. Never start a backup beside the
+replacements or rerun an old Compose project against its retained aliases.
 
 ## 5. Readiness and acceptance
+
+### Mandatory alias-ownership and DNS gate
+
+Run this immediately after cutover, before HTTP/UI acceptance. Record and verify
+the replacement IDs/project/service labels. On **each** shared external network,
+require exactly the intended running owner of every adopted test service alias
+(including both planner names). Stopped backups may retain aliases; they must
+remain stopped with restart disabled. Inspect `Aliases`, optional `DNSNames`, and
+container names so a renamed or manually created competitor cannot hide behind
+different Compose labels.
+
+Then resolve all aliases from all three intended containers, including WebUI.
+Every answer must be one of the intended target's **current inspected IPv4/IPv6
+addresses** on their shared networks. Docker may return one of several shared
+network addresses, so require a nonempty subset rather than one fixed IP or all
+addresses. Ownership inspection catches collisions even when a DNS query happens
+to return only the current API. No unknown container is ever stopped or changed
+by this gate. A failure blocks acceptance: inspect the reported ID/name/network,
+resolve ownership with its operator, and rerun the gate. Stop a known backup only
+after matching its recorded original ID; never stop an unknown owner automatically.
+
+```powershell
+$sharedNetworks = @('agent-internal', 'planner-egress-test')
+$testAliases = [ordered]@{
+  'knowledge-service-test' = 'knowledge-service-test'
+  'planner-service' = 'planner-service-test'
+  'planner-service-test' = 'planner-service-test'
+  'open-webui-test' = 'open-webui-test'
+}
+function Assert-Replacement {
+  param([string]$Name)
+  $containerId = Get-ContainerId $Name
+  $labels = Get-ComposeLabels $containerId
+  if (-not $replacementIds.ContainsKey($Name) -or $containerId -cne $replacementIds[$Name] -or
+      $originalIds.Values -contains $containerId -or
+      (Read-ContainerJson $containerId '{{json .Name}}') -cne "/$Name" -or
+      $labels.'com.docker.compose.project' -cne 'agent-document-test' -or
+      $labels.'com.docker.compose.service' -cne $services[$Name]) {
+    throw "Replacement identity/project/service mismatch for $Name; halt acceptance."
+  }
+  $running = Read-ContainerJson $containerId '{{json .State.Running}}'
+  if ($running -isnot [bool] -or -not $running) { throw "Replacement $Name ($containerId) is not running." }
+  return $containerId
+}
+function Assert-AliasOwners {
+  param([string]$Network)
+  $raw = & docker network inspect --format '{{json .Containers}}' $Network
+  if ($LASTEXITCODE -ne 0) { throw "Cannot inspect shared network $Network; halt acceptance." }
+  $members = ConvertFrom-Json -InputObject ($raw -join "`n") -ErrorAction Stop
+  if ($null -eq $members -or $members -isnot [pscustomobject]) { throw "Invalid network members for $Network." }
+  $owners = @{}
+  foreach ($alias in $testAliases.Keys) { $owners[$alias] = @() }
+  foreach ($member in $members.PSObject.Properties) {
+    $peerId = Get-ContainerId $member.Name
+    $running = Read-ContainerJson $peerId '{{json .State.Running}}'
+    if ($running -isnot [bool]) { throw "Invalid running state for $peerId on $Network." }
+    if (-not $running) { continue }
+    $peerName = Read-ContainerJson $peerId '{{json .Name}}'
+    $networks = Read-ContainerJson $peerId '{{json .NetworkSettings.Networks}}'
+    $attachment = $networks.PSObject.Properties[$Network]
+    if ($null -eq $attachment) { throw "Network membership changed for $peerId on $Network; rerun the gate." }
+    $dnsNames = @($attachment.Value.Aliases) + @($attachment.Value.DNSNames) + @($peerName.TrimStart('/'))
+    foreach ($alias in $testAliases.Keys) {
+      if ($dnsNames -contains $alias) {
+        if ($peerId -cne $replacementIds[$testAliases[$alias]]) {
+          throw "Alias collision: $alias on $Network also belongs to running $peerName ($peerId). Halt acceptance; inspect this owner and resolve with its operator. Never automatically stop an unknown container."
+        }
+        $owners[$alias] += $peerId
+      }
+    }
+  }
+  foreach ($alias in $testAliases.Keys) {
+    if ($owners[$alias].Count -ne 1) { throw "Alias $alias on $Network lacks its intended running owner; inspect attachments and rerun the gate." }
+  }
+}
+function Assert-DnsAnswers {
+  param([string]$Caller, [string]$Alias, $Actual, [string[]]$Expected)
+  if ($Actual -isnot [array] -or $Actual.Count -eq 0 -or $Expected.Count -eq 0) {
+    throw "Empty/invalid DNS answer for $Alias from $Caller; inspect shared-network DNS and rerun the gate."
+  }
+  foreach ($address in $Actual) {
+    if ($address -isnot [string]) { throw "Non-string DNS address for $Alias from $Caller; halt acceptance." }
+    try { $canonical = [Net.IPAddress]::Parse($address).ToString() }
+    catch { throw "Invalid DNS address for $Alias from $Caller; halt acceptance." }
+    if ($Expected -notcontains $canonical) {
+      throw "DNS mismatch: $Alias from $Caller returned $canonical; intended current IPs: $($Expected -join ', '). Inspect alias owners; halt acceptance and rerun after resolution. No containers were stopped by this gate."
+    }
+  }
+}
+foreach ($name in $backups.Keys) { Assert-Backup $name }
+foreach ($name in $services.Keys) {
+  # Capture once. Subsequent gate runs must retain these IDs, not adopt new owners.
+  if (-not $replacementIds.ContainsKey($name)) { $replacementIds[$name] = Get-ContainerId $name }
+  $null = Assert-Replacement $name
+}
+$replacementIds | ConvertTo-Json  # Save these additional non-secret IDs for rollback.
+foreach ($network in $sharedNetworks) { Assert-AliasOwners $network }
+$currentAddresses = @{}
+foreach ($name in $services.Keys) {
+  $containerId = Assert-Replacement $name
+  $networks = Read-ContainerJson $containerId '{{json .NetworkSettings.Networks}}'
+  $addresses = @()
+  foreach ($network in $sharedNetworks) {
+    $attachment = $networks.PSObject.Properties[$network]
+    if ($null -eq $attachment) { throw "Intended $name is missing shared network $network." }
+    foreach ($address in @($attachment.Value.IPAddress, $attachment.Value.GlobalIPv6Address)) {
+      if (-not [string]::IsNullOrWhiteSpace($address)) { $addresses += [Net.IPAddress]::Parse($address).ToString() }
+    }
+  }
+  if ($addresses.Count -eq 0) { throw "No current shared-network IPs for intended $name." }
+  $currentAddresses[$name] = @($addresses | Sort-Object -Unique)
+}
+$dnsProbe = @'
+import json, socket, sys
+answers = {alias: sorted({item[4][0] for item in socket.getaddrinfo(alias, None, socket.AF_UNSPEC, socket.SOCK_STREAM)}) for alias in sys.argv[1:]}
+print(json.dumps(answers))
+'@
+$aliasNames = @($testAliases.Keys)
+foreach ($name in $services.Keys) {
+  $containerId = Assert-Replacement $name
+  $raw = $dnsProbe | & docker exec -i $containerId python - @aliasNames
+  if ($LASTEXITCODE -ne 0) { throw "DNS probe failed from $name; inspect shared-network DNS before acceptance." }
+  $answers = ConvertFrom-Json -InputObject ($raw -join "`n") -ErrorAction Stop
+  foreach ($alias in $aliasNames) {
+    Assert-DnsAnswers $name $alias $answers.$alias $currentAddresses[$testAliases[$alias]]
+  }
+}
+foreach ($network in $sharedNetworks) { Assert-AliasOwners $network }
+foreach ($name in $backups.Keys) { Assert-Backup $name }
+foreach ($name in $services.Keys) { $null = Assert-Replacement $name }
+Write-Output 'Test service alias ownership and current-IP DNS checks passed.'
+```
+
+This is a cutover gate, not continuous monitoring. If attachments, IDs, or runtime
+state change during acceptance, halt and rerun it before using the UI again.
 
 - Check all three new containers are running, WebUI is healthy, and
   `http://127.0.0.1:3001` loads. Review bounded logs for startup failures, without
@@ -220,52 +481,89 @@ with structural evidence validation, not a semantic-correctness guarantee. Legac
 job-offer calculations remain the separate `analyze_with_planner` tool function.
 No generic writes, approvals, COMMIT, or reconcile are exposed.
 
+### Operator-reported v0.6g checkpoint
+
+Reported by the operator, not re-run for this documentation change: **95 offline
+tests passed**; real PDF extraction passed through WebUI; unrelated-document
+extraction, filename ambiguity, and partial/missing extraction also passed.
+Chat presentation still has limitations: check returned fields, statuses, and
+source quotes against the structured tool result. These exercised cases do not
+establish universal document/PDF support or semantic correctness.
+
 ## 6. Rollback (only the three new containers)
 
 If adoption partially fails, do not rerun renames blindly. Use the recorded
-`$backups`/`$originalIds` to identify what moved. After a completed rename phase,
-the following guarded rollback removes only new-project containers, never volumes
-or networks, then restores and starts the originals:
+`$backups`, `$originalIds`, `$originalProjects`, and `$originalRestartPolicies`
+to identify what moved. Keep the preflight helpers in the same PowerShell session;
+if the session was lost, load these maps from the saved non-secret recovery
+record and define the helpers first, without re-running capture/tagging/adoption.
+Also restore the `$services` constant; use the saved `$replacementIds` if available,
+or initialize it to `@{}` for a cutover that failed before those IDs were recorded.
+The rollback also handles originals still at their original names. It verifies
+all removal candidates first and removes only replacements with the exact TEST
+project/service/name/ID guards, never volumes or networks. **Only after replacement
+removal** does it restore names, exact captured restart policies (including
+`on-failure` retry counts), verify them, and start verified originals. No default
+restart policy is substituted. Unknown occupants cause an actionable refusal.
 
 ```powershell
-foreach ($name in $backups.Keys) {
-  $id = & docker container inspect --format '{{.Id}}' $name 2>$null
-  if ($LASTEXITCODE -eq 0) {
-    $labelsJson = & docker container inspect --format '{{json .Config.Labels}}' $name
-    if ($LASTEXITCODE -ne 0) { throw 'Refusing removal: label inspection failed.' }
-    try {
-      $labels = ConvertFrom-Json -InputObject $labelsJson -ErrorAction Stop
-    } catch {
-      throw 'Refusing removal: invalid container labels.'
-    }
-    if ($null -eq $labels -or $labels -isnot [pscustomobject] -or
-        $labelsJson -isnot [string] -or -not $labelsJson.TrimStart().StartsWith('{')) {
-      throw 'Refusing removal: invalid container labels.'
-    }
-    $project = $labels.'com.docker.compose.project'
-    if ($project -isnot [string] -or $project -cne 'agent-document-test' -or $id -eq $originalIds[$name]) {
-      throw 'Refusing removal: container is not one of the new TEST stack containers.'
-    }
-    & docker container rm --force $name
-    if ($LASTEXITCODE -ne 0) { throw 'New TEST container removal failed.' }
+$removals = [ordered]@{}
+function Assert-RemovalCandidate {
+  param([string]$Name, [string]$ContainerId)
+  $labels = Get-ComposeLabels $ContainerId
+  if ($originalIds.Values -contains $ContainerId -or (Get-ContainerId $Name) -cne $ContainerId -or
+      (Read-ContainerJson $ContainerId '{{json .Name}}') -cne "/$Name" -or
+      $labels.'com.docker.compose.project' -cne 'agent-document-test' -or
+      $labels.'com.docker.compose.service' -cne $services[$Name] -or
+      ($replacementIds.ContainsKey($Name) -and $replacementIds[$Name] -cne $ContainerId)) {
+    throw "Refusing removal of $Name ($ContainerId): ID/project/service mismatch. Inspect this occupant; never remove an unknown container."
   }
 }
 foreach ($name in $backups.Keys) {
-  $id = & docker container inspect --format '{{.Id}}' $backups[$name]
-  if ($LASTEXITCODE -ne 0 -or $id -ne $originalIds[$name]) { throw 'Original backup identity mismatch.' }
-  & docker container inspect --format '{{.Id}}' $name 2>$null | Out-Null
-  if ($LASTEXITCODE -eq 0) { throw 'Original name is occupied; never overwrite it.' }
-  & docker rename $backups[$name] $name
-  if ($LASTEXITCODE -ne 0) { throw 'Original name restoration failed.' }
+  $containerId = Find-ContainerId $name
+  if ($null -eq $containerId) { continue }
+  if ($containerId -ceq $originalIds[$name]) {
+    $null = Assert-Original $name $name  # Not renamed yet; never remove it.
+    continue
+  }
+  Assert-RemovalCandidate $name $containerId
+  $removals[$name] = $containerId
 }
-& docker start knowledge-service-test planner-service-test open-webui-test
-if ($LASTEXITCODE -ne 0) { throw 'Original TEST container startup failed.' }
+foreach ($name in $removals.Keys) {
+  $containerId = $removals[$name]
+  Assert-RemovalCandidate $name $containerId
+  & docker container rm --force $containerId | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw 'New TEST container removal failed; do not restore original restart policies yet.' }
+}
+foreach ($name in $backups.Keys) {
+  $occupant = Find-ContainerId $name
+  if ($null -ne $occupant) {
+    $null = Assert-Original $name $name
+    continue
+  }
+  $containerId = Assert-Original $name $backups[$name]
+  & docker container rename $containerId $name
+  if ($LASTEXITCODE -ne 0) { throw 'Original name restoration failed; keep backups restart-disabled until resolved.' }
+  $null = Assert-Original $name $name
+}
+foreach ($name in $backups.Keys) {
+  Set-OriginalRestartPolicy $name $name $originalRestartPolicies[$name]
+}
+foreach ($name in $backups.Keys) {
+  $containerId = Assert-Original $name $name
+  Assert-RestartPolicy $containerId $originalRestartPolicies[$name]
+  & docker container start $containerId | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw 'Original TEST container startup failed; inspect the verified original ID.' }
+}
 ```
 
 The shared external WebUI volume and external Chroma retain their state. Renamed
 containers are not data backups; rollback restores container configuration, not
 UI/database history. Test watcher indexing may change the isolated index during
 adoption. Recheck original readiness and saved UI configuration after rollback.
+An unknown competing alias owner remains an operator issue; rollback never
+removes it. Verify alias ownership and current-IP DNS again for the restored
+original IDs before resuming UI use.
 Finally remove only the empty scratch env file with
 `Remove-Item -LiteralPath $emptyEnvFile.FullName`; never remove volumes/networks
 or prune resources. All Compose invocations restore the caller's token environment.
